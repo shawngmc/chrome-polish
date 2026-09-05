@@ -14,6 +14,7 @@ import (
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/shawngmc/chrome-polish/app/internal/cdp"
@@ -23,7 +24,7 @@ import (
 
 const (
 	scanTimeout      = 15 * time.Second
-	permissionsCheck = "Check permissions (notifications, camera, microphone)"
+	permissionsCheck = "Check permissions"
 )
 
 // origins table columns.
@@ -65,8 +66,9 @@ var columnCategory = [numCols]string{
 // beyond the one already made to connect. Scoring is a pure function over
 // already-collected data and needs no connection at all.
 type OriginsPanel struct {
-	root fyne.CanvasObject
-	win  fyne.Window
+	controls fyne.CanvasObject
+	results  fyne.CanvasObject
+	win      fyne.Window
 
 	client *cdp.Client
 
@@ -112,7 +114,9 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 		func() (int, int) { return len(p.visible), numCols },
 		func() fyne.CanvasObject {
 			bg := canvas.NewRectangle(color.Transparent)
-			return container.NewStack(bg, widget.NewLabel(""))
+			label := widget.NewLabel("")
+			label.Truncation = fyne.TextTruncateEllipsis
+			return container.NewStack(bg, label)
 		},
 		func(id widget.TableCellID, obj fyne.CanvasObject) {
 			cell := obj.(*fyne.Container)
@@ -161,12 +165,14 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.filterEntry.SetPlaceHolder("Filter by domain...")
 	p.filterEntry.OnChanged = p.onFilterChanged
 
-	p.root = container.NewBorder(
-		container.NewVBox(
-			container.NewHBox(p.scanBtn, p.permsBtn, p.blocklistBtn, p.optionsBtn),
-			container.NewBorder(nil, nil, widget.NewLabel("Filter:"), nil, p.filterEntry),
-			p.status,
-		),
+	p.controls = container.NewVBox(
+		p.scanBtn, p.permsBtn, p.blocklistBtn, p.optionsBtn,
+		widget.NewSeparator(),
+		p.status,
+	)
+
+	p.results = container.NewBorder(
+		container.NewBorder(nil, nil, widget.NewLabel("Filter:"), nil, p.filterEntry),
 		p.detail,
 		nil, nil,
 		p.table,
@@ -175,10 +181,16 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	return p
 }
 
-// Container returns the panel's root canvas object, ready to place in a
-// window's content.
-func (p *OriginsPanel) Container() fyne.CanvasObject {
-	return p.root
+// Controls returns the panel's action buttons and status label, meant for
+// a sidebar alongside the connection controls.
+func (p *OriginsPanel) Controls() fyne.CanvasObject {
+	return p.controls
+}
+
+// Results returns the panel's filter box, table, and detail pane, meant
+// for the main content area.
+func (p *OriginsPanel) Results() fyne.CanvasObject {
+	return p.results
 }
 
 func (p *OriginsPanel) cellText(origin scan.Origin, col int) string {
@@ -269,15 +281,41 @@ func (p *OriginsPanel) onFilterChanged(text string) {
 func (p *OriginsPanel) applyFilter() {
 	if p.filter == "" {
 		p.visible = p.origins
-		return
+	} else {
+		visible := make([]scan.Origin, 0, len(p.origins))
+		for _, o := range p.origins {
+			if strings.Contains(strings.ToLower(o.Origin), p.filter) {
+				visible = append(visible, o)
+			}
+		}
+		p.visible = visible
 	}
-	visible := make([]scan.Origin, 0, len(p.origins))
-	for _, o := range p.origins {
-		if strings.Contains(strings.ToLower(o.Origin), p.filter) {
-			visible = append(visible, o)
+	p.resizeOriginColumn()
+}
+
+// resizeOriginColumn sizes the Origin column to fit the longest origin
+// currently visible, so hostnames aren't clipped, within sane bounds so a
+// single very long entry can't push the column absurdly wide.
+func (p *OriginsPanel) resizeOriginColumn() {
+	const minWidth, maxWidth = float32(150), float32(600)
+
+	textSize := theme.TextSize()
+	widest := float32(0)
+	for _, o := range p.visible {
+		w := fyne.MeasureText(o.Origin, textSize, fyne.TextStyle{}).Width
+		if w > widest {
+			widest = w
 		}
 	}
-	p.visible = visible
+
+	width := widest + theme.Padding()*4
+	switch {
+	case width < minWidth:
+		width = minWidth
+	case width > maxWidth:
+		width = maxWidth
+	}
+	p.table.SetColumnWidth(colOrigin, width)
 }
 
 // SetClient attaches (or, with nil, detaches) the connected client this

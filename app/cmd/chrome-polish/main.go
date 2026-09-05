@@ -6,7 +6,6 @@
 package main
 
 import (
-	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
@@ -19,6 +18,11 @@ func main() {
 	a := app.New()
 	w := a.NewWindow("Chrome Polish")
 
+	title := widget.NewRichText(&widget.TextSegment{
+		Text:  "Chrome Polish",
+		Style: widget.RichTextStyleHeading,
+	})
+
 	connectPanel := ui.NewConnectPanel()
 	originsPanel := ui.NewOriginsPanel(w)
 
@@ -29,16 +33,20 @@ func main() {
 		originsPanel.SetClient(nil)
 	}
 
+	sidebar := container.NewVBox(
+		title,
+		widget.NewSeparator(),
+		connectPanel.Container(),
+		widget.NewSeparator(),
+		originsPanel.Controls(),
+	)
+
 	w.SetContent(container.NewBorder(
-		container.NewVBox(
-			widget.NewLabel("Chrome Polish"),
-			connectPanel.Container(),
-			widget.NewSeparator(),
-		),
-		nil, nil, nil,
-		originsPanel.Container(),
+		nil, nil,
+		sidebar, nil,
+		originsPanel.Results(),
 	))
 
-	w.Resize(fyne.NewSize(560, 480))
+	maximizeWindow(w)
 	w.ShowAndRun()
 }
