@@ -1,0 +1,12 @@
+# OS
+.DS_Store
+
+# Go
+/bin/
+*.test
+*.out
+
+# Hugo
+/docs/public/
+/docs/resources/
+/docs/.hugo_build.lock
