@@ -10,23 +10,35 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
+
+	"github.com/shawngmc/chrome-polish/app/internal/cdp"
+	"github.com/shawngmc/chrome-polish/app/internal/ui"
 )
 
 func main() {
 	a := app.New()
 	w := a.NewWindow("Chrome Polish")
 
-	status := widget.NewLabel("Not connected.")
-	connectBtn := widget.NewButton("Connect...", func() {
-		status.SetText("TODO: connect to Chrome via CDP")
-	})
+	connectPanel := ui.NewConnectPanel()
+	originsPanel := ui.NewOriginsPanel(w)
 
-	w.SetContent(container.NewVBox(
-		widget.NewLabel("Chrome Polish"),
-		status,
-		connectBtn,
+	connectPanel.OnConnected = func(client *cdp.Client) {
+		originsPanel.SetClient(client)
+	}
+	connectPanel.OnDisconnected = func() {
+		originsPanel.SetClient(nil)
+	}
+
+	w.SetContent(container.NewBorder(
+		container.NewVBox(
+			widget.NewLabel("Chrome Polish"),
+			connectPanel.Container(),
+			widget.NewSeparator(),
+		),
+		nil, nil, nil,
+		originsPanel.Container(),
 	))
 
-	w.Resize(fyne.NewSize(480, 320))
+	w.Resize(fyne.NewSize(560, 480))
 	w.ShowAndRun()
 }
