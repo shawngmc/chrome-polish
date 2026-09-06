@@ -16,12 +16,10 @@ import (
 
 func main() {
 	a := app.New()
+	a.SetIcon(resourceIconPng)
 	w := a.NewWindow("Chrome Polish")
 
-	title := widget.NewRichText(&widget.TextSegment{
-		Text:  "Chrome Polish",
-		Style: widget.RichTextStyleHeading,
-	})
+	title := ui.Wordmark()
 
 	connectPanel := ui.NewConnectPanel()
 	originsPanel := ui.NewOriginsPanel(w)

@@ -5,6 +5,16 @@
 /bin/
 *.test
 *.out
+# stray binaries from a plain `go build ./...` in a module dir
+/relay/chrome-polish-relay
+/app/cmd/chrome-polish/chrome-polish
+
+# Packaging output (fyne package)
+/app/cmd/chrome-polish/*.app
+/app/cmd/chrome-polish/*.exe
+/app/cmd/chrome-polish/*.tar.xz
+/app/cmd/chrome-polish/*.dmg
+/dist/
 
 # Hugo
 /docs/public/
