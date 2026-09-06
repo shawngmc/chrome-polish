@@ -18,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"github.com/shawngmc/chrome-polish/app/internal/cdp"
+	"github.com/shawngmc/chrome-polish/app/internal/removal"
 	"github.com/shawngmc/chrome-polish/app/internal/reputation"
 	"github.com/shawngmc/chrome-polish/app/internal/scan"
 )
@@ -29,7 +30,8 @@ const (
 
 // origins table columns.
 const (
-	colOrigin = iota
+	colSelect = iota
+	colOrigin
 	colScore
 	colBlocklisted
 	colCookie
@@ -76,6 +78,7 @@ type OriginsPanel struct {
 	permsBtn     *widget.Button
 	blocklistBtn *widget.Button
 	optionsBtn   *widget.Button
+	removeBtn    *widget.Button
 	filterEntry  *widget.Entry
 	status       *widget.Label
 	detail       *widget.Label
@@ -87,6 +90,7 @@ type OriginsPanel struct {
 	permissions map[string]map[string]scan.PermissionStatus // origin -> category -> status
 	scores      map[string]reputation.Score                 // origin -> score
 	blocklist   reputation.Blocklist
+	selected    map[string]bool // origin -> checked, for bulk removal
 
 	sortCol        int // -1 if unsorted
 	sortAsc        bool
@@ -101,6 +105,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 		win:         win,
 		permissions: make(map[string]map[string]scan.PermissionStatus),
 		scores:      make(map[string]reputation.Score),
+		selected:    make(map[string]bool),
 		sortCol:     -1,
 	}
 
@@ -116,32 +121,67 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 			bg := canvas.NewRectangle(color.Transparent)
 			label := widget.NewLabel("")
 			label.Truncation = fyne.TextTruncateEllipsis
-			return container.NewStack(bg, label)
+			check := widget.NewCheck("", nil)
+			return container.NewStack(bg, label, check)
 		},
 		func(id widget.TableCellID, obj fyne.CanvasObject) {
 			cell := obj.(*fyne.Container)
 			bg := cell.Objects[0].(*canvas.Rectangle)
 			label := cell.Objects[1].(*widget.Label)
+			check := cell.Objects[2].(*widget.Check)
 
 			origin := p.visible[id.Row]
-			label.SetText(p.cellText(origin, id.Col))
 
 			bg.FillColor = color.Transparent
 			if id.Col == colScore {
 				bg.FillColor = p.scoreColor(p.scores[origin.Origin].Total)
 			}
 			bg.Refresh()
+
+			if id.Col == colSelect {
+				label.Hide()
+				// Clear the (possibly stale, reused-from-another-row)
+				// callback before syncing state, so SetChecked can't fire
+				// a handler still capturing a different origin.
+				check.OnChanged = nil
+				check.SetChecked(p.selected[origin.Origin])
+				o := origin.Origin
+				check.OnChanged = func(checked bool) { p.onToggleSelect(o, checked) }
+				check.Show()
+				return
+			}
+
+			check.Hide()
+			label.SetText(p.cellText(origin, id.Col))
+			label.Show()
 		},
 	)
 	p.table.ShowHeaderRow = true
-	p.table.CreateHeader = func() fyne.CanvasObject { return widget.NewButton("", nil) }
+	p.table.CreateHeader = func() fyne.CanvasObject {
+		return container.NewStack(widget.NewButton("", nil), widget.NewCheck("", nil))
+	}
 	p.table.UpdateHeader = func(id widget.TableCellID, obj fyne.CanvasObject) {
-		btn := obj.(*widget.Button)
+		cell := obj.(*fyne.Container)
+		btn := cell.Objects[0].(*widget.Button)
+		check := cell.Objects[1].(*widget.Check)
+
+		if id.Col == colSelect {
+			btn.Hide()
+			check.OnChanged = nil
+			check.SetChecked(p.allVisibleSelected())
+			check.OnChanged = p.onToggleSelectAll
+			check.Show()
+			return
+		}
+
+		check.Hide()
 		btn.SetText(p.headerText(id.Col))
 		col := id.Col
 		btn.OnTapped = func() { p.onSortColumn(col) }
+		btn.Show()
 	}
 	p.table.OnSelected = func(id widget.TableCellID) { p.showDetail(id.Row) }
+	p.table.SetColumnWidth(colSelect, 40)
 	p.table.SetColumnWidth(colOrigin, 280)
 	p.table.SetColumnWidth(colScore, 70)
 	p.table.SetColumnWidth(colBlocklisted, 100)
@@ -161,6 +201,10 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 
 	p.optionsBtn = widget.NewButton("Options...", p.onOptions)
 
+	p.removeBtn = widget.NewButton("Remove data...", p.onRemove)
+	p.removeBtn.Importance = widget.DangerImportance
+	p.removeBtn.Disable()
+
 	p.filterEntry = widget.NewEntry()
 	p.filterEntry.SetPlaceHolder("Filter by domain...")
 	p.filterEntry.OnChanged = p.onFilterChanged
@@ -173,7 +217,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 
 	p.results = container.NewBorder(
 		container.NewBorder(nil, nil, widget.NewLabel("Filter:"), nil, p.filterEntry),
-		p.detail,
+		container.NewVBox(p.detail, p.removeBtn),
 		nil, nil,
 		p.table,
 	)
@@ -250,6 +294,55 @@ func (p *OriginsPanel) isBlocklisted(origin string) bool {
 		}
 	}
 	return false
+}
+
+func (p *OriginsPanel) onToggleSelect(origin string, checked bool) {
+	if checked {
+		p.selected[origin] = true
+	} else {
+		delete(p.selected, origin)
+	}
+	p.updateRemoveButton()
+	p.table.Refresh() // so the header "select all" checkbox reflects the change
+}
+
+func (p *OriginsPanel) onToggleSelectAll(checked bool) {
+	for _, o := range p.visible {
+		if checked {
+			p.selected[o.Origin] = true
+		} else {
+			delete(p.selected, o.Origin)
+		}
+	}
+	p.updateRemoveButton()
+	p.table.Refresh()
+}
+
+func (p *OriginsPanel) allVisibleSelected() bool {
+	if len(p.visible) == 0 {
+		return false
+	}
+	for _, o := range p.visible {
+		if !p.selected[o.Origin] {
+			return false
+		}
+	}
+	return true
+}
+
+// updateRemoveButton syncs the Remove button's label and enabled state to
+// the current selection count.
+func (p *OriginsPanel) updateRemoveButton() {
+	n := len(p.selected)
+	if n == 0 {
+		p.removeBtn.SetText("Remove data...")
+		p.removeBtn.Disable()
+		return
+	}
+	p.removeBtn.SetText(fmt.Sprintf("Remove data (%d)...", n))
+	if p.client != nil {
+		p.removeBtn.Enable()
+	}
 }
 
 func (p *OriginsPanel) countBlocklisted() int {
@@ -329,8 +422,10 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	p.permissions = make(map[string]map[string]scan.PermissionStatus)
 	p.scores = make(map[string]reputation.Score)
 	p.sortCol = -1
+	p.selected = make(map[string]bool)
 	p.detail.SetText("Select a row to see why it was scored that way.")
 	p.filterEntry.SetText("") // triggers onFilterChanged -> applyFilter
+	p.updateRemoveButton()
 	p.table.Refresh()
 
 	if client != nil {
@@ -491,6 +586,107 @@ func (p *OriginsPanel) onLoadBlocklist() {
 		}
 		p.status.SetText(msg)
 	}, p.win)
+}
+
+// onRemove opens a confirmation dialog for clearing the checked origins'
+// data, letting the person pick exactly which storage types to clear
+// (DESIGN.md section 4.3: precise, per-type removal, never a blanket
+// wipe) before anything actually happens.
+func (p *OriginsPanel) onRemove() {
+	if len(p.selected) == 0 || p.client == nil {
+		return
+	}
+
+	origins := make([]string, 0, len(p.selected))
+	for o := range p.selected {
+		origins = append(origins, o)
+	}
+	sort.Strings(origins)
+
+	defaultChecked := make(map[removal.StorageType]bool, len(removal.DefaultStorageTypes))
+	for _, t := range removal.DefaultStorageTypes {
+		defaultChecked[t] = true
+	}
+
+	checks := make(map[removal.StorageType]*widget.Check, len(removal.AllStorageTypes))
+	typeList := container.NewVBox()
+	for _, t := range removal.AllStorageTypes {
+		check := widget.NewCheck(string(t), nil)
+		check.SetChecked(defaultChecked[t])
+		checks[t] = check
+		typeList.Add(check)
+	}
+
+	const previewLimit = 10
+	preview := origins
+	suffix := ""
+	if len(preview) > previewLimit {
+		preview = preview[:previewLimit]
+		suffix = fmt.Sprintf("\n... and %d more", len(origins)-previewLimit)
+	}
+
+	content := container.NewVBox(
+		widget.NewLabel(fmt.Sprintf("Clear the checked data types for %d origin(s):", len(origins))),
+		widget.NewLabel(strings.Join(preview, "\n")+suffix),
+		widget.NewSeparator(),
+		typeList,
+	)
+
+	dialog.NewCustomConfirm("Remove Data", "Remove", "Cancel", content, func(confirmed bool) {
+		if !confirmed {
+			return
+		}
+
+		var selectedTypes []removal.StorageType
+		for _, t := range removal.AllStorageTypes {
+			if checks[t].Checked {
+				selectedTypes = append(selectedTypes, t)
+			}
+		}
+		if len(selectedTypes) == 0 {
+			p.status.SetText("No storage types selected — nothing removed.")
+			return
+		}
+
+		p.removeBtn.Disable()
+		p.status.SetText(fmt.Sprintf("Removing data for %d origin(s)...", len(origins)))
+		go p.remove(p.client, origins, selectedTypes)
+	}, p.win).Show()
+}
+
+// removeTimeout scales with batch size since each origin is cleared via
+// its own throwaway target/session round trip (see removal.ClearOrigin).
+func removeTimeout(n int) time.Duration {
+	return scanTimeout + time.Duration(n)*3*time.Second
+}
+
+func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []removal.StorageType) {
+	ctx, cancel := context.WithTimeout(context.Background(), removeTimeout(len(origins)))
+	defer cancel()
+
+	results := removal.ClearOrigins(ctx, client, origins, types)
+
+	fyne.Do(func() {
+		succeeded := 0
+		var failed []string
+		for _, r := range results {
+			if r.Err != nil {
+				failed = append(failed, fmt.Sprintf("%s (%v)", r.Origin, r.Err))
+				continue
+			}
+			succeeded++
+			delete(p.selected, r.Origin)
+		}
+
+		p.updateRemoveButton()
+		p.table.Refresh()
+
+		if len(failed) == 0 {
+			p.status.SetText(fmt.Sprintf("Cleared data for %d origin(s). Re-scan to confirm.", succeeded))
+			return
+		}
+		p.status.SetText(fmt.Sprintf("Cleared %d of %d origin(s). Failed: %s", succeeded, len(results), strings.Join(failed, "; ")))
+	})
 }
 
 func (p *OriginsPanel) onScan() {

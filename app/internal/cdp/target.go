@@ -1,17 +1,18 @@
-package scan
+package cdp
 
 import (
 	"context"
 	"fmt"
-
-	"github.com/shawngmc/chrome-polish/app/internal/cdp"
 )
 
-// attachTarget opens a throwaway target navigated to targetURL and attaches
+// AttachTarget opens a throwaway target navigated to targetURL and attaches
 // a flattened session to it, returning the sessionID and a cleanup
-// function that detaches and closes the target. Some CDP domains
-// (ServiceWorker, and DOM/Runtime access to a specific document) are only
-// available within a target session, not on the browser-level connection.
+// function that detaches and closes the target. Some CDP domains are only
+// available within a target session, not on the browser-level connection
+// itself — ServiceWorker is one (Chrome returns "method not found"
+// otherwise), and Storage.clearDataForOrigin appears to be another (it
+// fails with a generic internal error at the browser level, at least
+// under the flag-less chrome://inspect/#remote-debugging toggle).
 //
 // background controls whether the new target is created in the background
 // (false brings it to the foreground, briefly switching the person's
@@ -23,7 +24,7 @@ import (
 // Callers must only ever pass a local, static Chrome URL here (e.g.
 // "about:blank" or a chrome://settings/... page) — never a
 // candidate/suspect origin.
-func attachTarget(ctx context.Context, client *cdp.Client, targetURL string, background bool) (sessionID string, cleanup func(), err error) {
+func AttachTarget(ctx context.Context, client *Client, targetURL string, background bool) (sessionID string, cleanup func(), err error) {
 	var created struct {
 		TargetID string `json:"targetId"`
 	}
@@ -31,7 +32,7 @@ func attachTarget(ctx context.Context, client *cdp.Client, targetURL string, bac
 		"url":        targetURL,
 		"background": background,
 	}, &created); err != nil {
-		return "", nil, fmt.Errorf("scan: Target.createTarget: %w", err)
+		return "", nil, fmt.Errorf("cdp: Target.createTarget: %w", err)
 	}
 
 	var attached struct {
@@ -42,7 +43,7 @@ func attachTarget(ctx context.Context, client *cdp.Client, targetURL string, bac
 		"flatten":  true,
 	}, &attached); err != nil {
 		_ = client.Call(context.Background(), "Target.closeTarget", map[string]any{"targetId": created.TargetID}, nil)
-		return "", nil, fmt.Errorf("scan: Target.attachToTarget: %w", err)
+		return "", nil, fmt.Errorf("cdp: Target.attachToTarget: %w", err)
 	}
 
 	cleanup = func() {

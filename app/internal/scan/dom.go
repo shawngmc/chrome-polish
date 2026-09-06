@@ -95,7 +95,7 @@ func DumpDOM(ctx context.Context, client *cdp.Client, targetURL string, settleDe
 		settleDelay = 500 * time.Millisecond
 	}
 
-	sessionID, cleanup, err := attachTarget(ctx, client, targetURL, !foreground)
+	sessionID, cleanup, err := cdp.AttachTarget(ctx, client, targetURL, !foreground)
 	if err != nil {
 		return nil, err
 	}

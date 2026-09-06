@@ -157,7 +157,7 @@ type workerRegistrationUpdatedParams struct {
 // (Chrome tracks service workers per profile, not per tab), not just the
 // blank tab, and no candidate/suspect origin is ever navigated to.
 func discoverFromServiceWorkers(ctx context.Context, client *cdp.Client, window time.Duration) ([]string, error) {
-	sessionID, cleanup, err := attachTarget(ctx, client, "about:blank", true)
+	sessionID, cleanup, err := cdp.AttachTarget(ctx, client, "about:blank", true)
 	if err != nil {
 		return nil, err
 	}
