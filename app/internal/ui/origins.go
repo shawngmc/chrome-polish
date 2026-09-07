@@ -109,6 +109,13 @@ type OriginsPanel struct {
 	sortAsc        bool
 	colorBlindMode bool
 
+	// opGen increments every SetClient call. An in-flight operation
+	// (scan/checkPermissions/refresh/remove/deepClean) captures it at
+	// launch via beginOp and passes it back to endOp, so a completion
+	// superseded by a disconnect/reconnect recognizes itself as stale and
+	// no-ops instead of clobbering the newer connection's state.
+	opGen int
+
 	// simpleMode is the default UI mode: on connect, origins and
 	// permissions are scanned automatically, and the manual Scan/Check
 	// buttons are replaced by a single Refresh button. Advanced mode (the
@@ -428,17 +435,37 @@ func (p *OriginsPanel) countBlocklisted() int {
 	return n
 }
 
-// setBusy shows or hides the indeterminate progress bar that marks a scan,
-// permission check, or removal in flight. Callers on a goroutine must wrap
-// this in fyne.Do.
-func (p *OriginsPanel) setBusy(busy bool) {
-	if busy {
-		p.busy.Show()
-		p.busy.Start()
+// beginOp starts an origin-panel operation (scan, permission check, refresh,
+// remove, or deep clean): it disables every action button so at most one of
+// them can run against the shared client at a time, shows the busy
+// indicator, and sets the status text. Its return value is this operation's
+// generation; pass it to endOp so a completion superseded by a
+// disconnect/reconnect (see opGen) can recognize itself as stale and no-op.
+func (p *OriginsPanel) beginOp(statusMsg string) int {
+	p.scanBtn.Disable()
+	p.permsBtn.Disable()
+	p.refreshBtn.Disable()
+	p.removeBtn.Disable()
+	p.deepCleanBtn.Disable()
+	p.status.SetText(statusMsg)
+	p.busy.Show()
+	return p.opGen
+}
+
+// endOp reverses beginOp once an operation's goroutine completes. Callers on
+// a goroutine must wrap this in fyne.Do. If gen no longer matches the
+// current generation, SetClient has already superseded this operation and
+// reset button/busy state itself, so this is a no-op.
+func (p *OriginsPanel) endOp(gen int) {
+	if gen != p.opGen {
 		return
 	}
-	p.busy.Stop()
 	p.busy.Hide()
+	p.scanBtn.Enable()
+	p.permsBtn.Enable()
+	p.refreshBtn.Enable()
+	p.updateRemoveButton()
+	p.updateDeepCleanButton()
 }
 
 func pluralize(n int, singular, plural string) string {
@@ -502,6 +529,7 @@ func (p *OriginsPanel) resizeOriginColumn() {
 // clearing any previous results. The loaded blocklist, if any, is kept —
 // it's operator configuration, not per-session scan state.
 func (p *OriginsPanel) SetClient(client *cdp.Client) {
+	p.opGen++ // supersede any operation still running against the old client
 	p.client = client
 	p.origins = nil
 	p.visible = nil
@@ -518,18 +546,17 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	p.table.Refresh()
 
 	if client != nil {
-		p.scanBtn.Enable()
-		p.permsBtn.Enable()
-		p.refreshBtn.Enable()
 		if p.simpleMode {
-			p.refreshBtn.Disable()
-			p.status.SetText("Connected. Scanning (this will briefly switch your active Chrome tab to read site data)...")
-			p.setBusy(true)
-			go p.refresh(client)
+			gen := p.beginOp("Connected. Scanning (this will briefly switch your active Chrome tab to read site data)...")
+			go p.refresh(client, gen)
 		} else {
+			p.scanBtn.Enable()
+			p.permsBtn.Enable()
+			p.refreshBtn.Enable()
 			p.status.SetText("Connected. Ready to scan.")
 		}
 	} else {
+		p.busy.Hide()
 		p.scanBtn.Disable()
 		p.permsBtn.Disable()
 		p.refreshBtn.Disable()
@@ -770,10 +797,8 @@ func (p *OriginsPanel) onRemove() {
 			return
 		}
 
-		p.removeBtn.Disable()
-		p.status.SetText(fmt.Sprintf("Removing data for %d origin(s)...", len(origins)))
-		p.setBusy(true)
-		go p.remove(p.client, origins, selectedTypes)
+		gen := p.beginOp(fmt.Sprintf("Removing data for %d origin(s)...", len(origins)))
+		go p.remove(p.client, origins, selectedTypes, gen)
 	}, p.win).Show()
 }
 
@@ -783,14 +808,13 @@ func removeTimeout(n int) time.Duration {
 	return scanTimeout + time.Duration(n)*3*time.Second
 }
 
-func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []removal.StorageType) {
+func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []removal.StorageType, gen int) {
 	ctx, cancel := context.WithTimeout(context.Background(), removeTimeout(len(origins)))
 	defer cancel()
 
 	results := removal.ClearOrigins(ctx, client, origins, types)
 
 	fyne.Do(func() {
-		p.setBusy(false)
 		succeeded := 0
 		var failed []string
 		for _, r := range results {
@@ -802,9 +826,8 @@ func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []remo
 			delete(p.selected, r.Origin)
 		}
 
-		p.updateRemoveButton()
-		p.updateDeepCleanButton()
 		p.table.Refresh()
+		defer p.endOp(gen)
 
 		if len(failed) == 0 {
 			p.status.SetText(fmt.Sprintf("Cleared data for %d origin(s). Re-scan to confirm.", succeeded))
@@ -864,21 +887,18 @@ func (p *OriginsPanel) onDeepClean() {
 			return
 		}
 
-		p.deepCleanBtn.Disable()
-		p.status.SetText(fmt.Sprintf("Deep cleaning %d site(s)...", len(keys)))
-		p.setBusy(true)
-		go p.deepClean(p.client, keys)
+		gen := p.beginOp(fmt.Sprintf("Deep cleaning %d site(s)...", len(keys)))
+		go p.deepClean(p.client, keys, gen)
 	}, p.win).Show()
 }
 
-func (p *OriginsPanel) deepClean(client *cdp.Client, groupingKeys []string) {
+func (p *OriginsPanel) deepClean(client *cdp.Client, groupingKeys []string, gen int) {
 	ctx, cancel := context.WithTimeout(context.Background(), removeTimeout(len(groupingKeys)))
 	defer cancel()
 
 	results := removal.ClearSiteGroups(ctx, client, groupingKeys)
 
 	fyne.Do(func() {
-		p.setBusy(false)
 		succeededKeys := make(map[string]bool, len(results))
 		succeeded := 0
 		var failed []string
@@ -897,9 +917,8 @@ func (p *OriginsPanel) deepClean(client *cdp.Client, groupingKeys []string) {
 			}
 		}
 
-		p.updateRemoveButton()
-		p.updateDeepCleanButton()
 		p.table.Refresh()
+		defer p.endOp(gen)
 
 		if len(failed) == 0 {
 			p.status.SetText(fmt.Sprintf("Deep cleaned %d site(s). Re-scan to confirm.", succeeded))
@@ -915,11 +934,8 @@ func (p *OriginsPanel) onScan() {
 		return
 	}
 
-	p.scanBtn.Disable()
-	p.status.SetText("Scanning (this will briefly switch your active Chrome tab to read site data)...")
-	p.setBusy(true)
-
-	go p.scan(client)
+	gen := p.beginOp("Scanning (this will briefly switch your active Chrome tab to read site data)...")
+	go p.scan(client, gen)
 }
 
 // originScan holds the result of discoverOrigins, so callers that need to
@@ -959,28 +975,25 @@ func discoverOrigins(ctx context.Context, client *cdp.Client) (originScan, error
 	return res, nil
 }
 
-func (p *OriginsPanel) scan(client *cdp.Client) {
+func (p *OriginsPanel) scan(client *cdp.Client, gen int) {
 	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
 	defer cancel()
 
 	res, err := discoverOrigins(ctx, client)
 	if err != nil {
 		fyne.Do(func() {
-			p.setBusy(false)
-			p.scanBtn.Enable()
 			p.status.SetText("Scan failed: " + err.Error())
+			p.endOp(gen)
 		})
 		return
 	}
 
 	fyne.Do(func() {
-		p.setBusy(false)
-		p.scanBtn.Enable()
 		p.origins = res.merged
 		p.homeGroup = res.homeGroup
 		p.groupNames = res.groupNames
 		p.recomputeScores()
-		p.updateDeepCleanButton()
+		defer p.endOp(gen)
 
 		if res.siteDataErr != nil {
 			p.status.SetText(fmt.Sprintf("Found %d candidate origin(s). Site-data scan failed: %v", len(res.merged), res.siteDataErr))
@@ -996,22 +1009,18 @@ func (p *OriginsPanel) onCheckPermissions() {
 		return
 	}
 
-	p.permsBtn.Disable()
-	p.status.SetText("Checking permissions (this will briefly switch your active Chrome tab, once per permission type)...")
-	p.setBusy(true)
-
-	go p.checkPermissions(client)
+	gen := p.beginOp("Checking permissions (this will briefly switch your active Chrome tab, once per permission type)...")
+	go p.checkPermissions(client, gen)
 }
 
-func (p *OriginsPanel) checkPermissions(client *cdp.Client) {
+func (p *OriginsPanel) checkPermissions(client *cdp.Client, gen int) {
 	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
 	defer cancel()
 
 	permissions, err := scan.DiscoverAllPermissions(ctx, client, scan.DefaultPermissionCategories)
 
 	fyne.Do(func() {
-		p.setBusy(false)
-		p.permsBtn.Enable()
+		defer p.endOp(gen)
 		if err != nil {
 			p.status.SetText("Checking permissions failed: " + err.Error())
 			return
@@ -1037,29 +1046,27 @@ func (p *OriginsPanel) onRefresh() {
 		return
 	}
 
-	p.refreshBtn.Disable()
-	p.status.SetText("Scanning (this will briefly switch your active Chrome tab to read site data)...")
-	p.setBusy(true)
-
-	go p.refresh(client)
+	gen := p.beginOp("Scanning (this will briefly switch your active Chrome tab to read site data)...")
+	go p.refresh(client, gen)
 }
 
-func (p *OriginsPanel) refresh(client *cdp.Client) {
+func (p *OriginsPanel) refresh(client *cdp.Client, gen int) {
 	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
 	defer cancel()
 
 	res, err := discoverOrigins(ctx, client)
 	if err != nil {
 		fyne.Do(func() {
-			p.setBusy(false)
-			p.refreshBtn.Enable()
 			p.status.SetText("Scan failed: " + err.Error())
+			p.endOp(gen)
 		})
 		return
 	}
 
 	fyne.Do(func() {
-		p.status.SetText("Checking permissions (this will briefly switch your active Chrome tab, once per permission type)...")
+		if gen == p.opGen {
+			p.status.SetText("Checking permissions (this will briefly switch your active Chrome tab, once per permission type)...")
+		}
 	})
 
 	permCtx, permCancel := context.WithTimeout(context.Background(), scanTimeout)
@@ -1067,8 +1074,6 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 	permissions, permErr := scan.DiscoverAllPermissions(permCtx, client, scan.DefaultPermissionCategories)
 
 	fyne.Do(func() {
-		p.setBusy(false)
-		p.refreshBtn.Enable()
 		p.origins = res.merged
 		p.homeGroup = res.homeGroup
 		p.groupNames = res.groupNames
@@ -1076,7 +1081,7 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 			p.permissions = permissions
 		}
 		p.recomputeScores()
-		p.updateDeepCleanButton()
+		defer p.endOp(gen)
 
 		msg := fmt.Sprintf("Found %d candidate origin(s)", len(res.merged))
 		if res.siteDataErr != nil {
