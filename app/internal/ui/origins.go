@@ -78,6 +78,7 @@ type OriginsPanel struct {
 
 	scanBtn      *widget.Button
 	permsBtn     *widget.Button
+	refreshBtn   *widget.Button
 	blocklistBtn *widget.Button
 	optionsBtn   *widget.Button
 	removeBtn    *widget.Button
@@ -106,6 +107,12 @@ type OriginsPanel struct {
 	sortCol        int // -1 if unsorted
 	sortAsc        bool
 	colorBlindMode bool
+
+	// simpleMode is the default UI mode: on connect, origins and
+	// permissions are scanned automatically, and the manual Scan/Check
+	// buttons are replaced by a single Refresh button. Advanced mode (the
+	// prior, fully manual behavior) is reachable from the Options dialog.
+	simpleMode bool
 }
 
 // NewOriginsPanel builds a ready-to-use origins panel. It starts with no
@@ -118,6 +125,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 		scores:      make(map[string]reputation.Score),
 		selected:    make(map[string]bool),
 		sortCol:     -1,
+		simpleMode:  true,
 	}
 
 	p.status = widget.NewLabel("Connect first, then scan for candidate origins.")
@@ -209,6 +217,9 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.permsBtn = widget.NewButton(permissionsCheck, p.onCheckPermissions)
 	p.permsBtn.Disable()
 
+	p.refreshBtn = widget.NewButton("Refresh", p.onRefresh)
+	p.refreshBtn.Disable()
+
 	p.blocklistBtn = widget.NewButton("Load blocklist...", p.onLoadBlocklist)
 
 	p.optionsBtn = widget.NewButton("Options...", p.onOptions)
@@ -226,10 +237,11 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.filterEntry.OnChanged = p.onFilterChanged
 
 	p.controls = container.NewVBox(
-		p.scanBtn, p.permsBtn, p.blocklistBtn, p.optionsBtn,
+		p.scanBtn, p.permsBtn, p.refreshBtn, p.blocklistBtn, p.optionsBtn,
 		widget.NewSeparator(),
 		p.status,
 	)
+	p.applyMode()
 
 	p.results = container.NewBorder(
 		container.NewBorder(nil, nil, widget.NewLabel("Filter:"), nil, p.filterEntry),
@@ -490,11 +502,33 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	if client != nil {
 		p.scanBtn.Enable()
 		p.permsBtn.Enable()
-		p.status.SetText("Connected. Ready to scan.")
+		p.refreshBtn.Enable()
+		if p.simpleMode {
+			p.refreshBtn.Disable()
+			p.status.SetText("Connected. Scanning (this will briefly switch your active Chrome tab to read site data)...")
+			go p.refresh(client)
+		} else {
+			p.status.SetText("Connected. Ready to scan.")
+		}
 	} else {
 		p.scanBtn.Disable()
 		p.permsBtn.Disable()
+		p.refreshBtn.Disable()
 		p.status.SetText("Connect first, then scan for candidate origins.")
+	}
+}
+
+// applyMode shows/hides the manual Scan/Check buttons and the combined
+// Refresh button to match simpleMode.
+func (p *OriginsPanel) applyMode() {
+	if p.simpleMode {
+		p.scanBtn.Hide()
+		p.permsBtn.Hide()
+		p.refreshBtn.Show()
+	} else {
+		p.scanBtn.Show()
+		p.permsBtn.Show()
+		p.refreshBtn.Hide()
 	}
 }
 
@@ -609,12 +643,20 @@ func (p *OriginsPanel) scoreColor(score int) color.Color {
 }
 
 func (p *OriginsPanel) onOptions() {
-	check := widget.NewCheck("Color-blind friendly score colors", func(checked bool) {
+	colorBlindCheck := widget.NewCheck("Color-blind friendly score colors", func(checked bool) {
 		p.colorBlindMode = checked
 		p.table.Refresh()
 	})
-	check.SetChecked(p.colorBlindMode)
-	dialog.ShowCustom("Options", "Close", check, p.win)
+	colorBlindCheck.SetChecked(p.colorBlindMode)
+
+	advancedCheck := widget.NewCheck("Advanced mode (manual scan and permission checks)", func(checked bool) {
+		p.simpleMode = !checked
+		p.applyMode()
+	})
+	advancedCheck.SetChecked(!p.simpleMode)
+
+	content := container.NewVBox(colorBlindCheck, advancedCheck)
+	dialog.ShowCustom("Options", "Close", content, p.win)
 }
 
 func (p *OriginsPanel) onLoadBlocklist() {
@@ -856,11 +898,48 @@ func (p *OriginsPanel) onScan() {
 	go p.scan(client)
 }
 
+// originScan holds the result of discoverOrigins, so callers that need to
+// combine it with other work (see refresh) can hold onto it before touching
+// panel state on the Fyne main thread.
+type originScan struct {
+	merged      []scan.Origin
+	homeGroup   map[string]string
+	groupNames  map[string]string
+	numGroups   int
+	siteDataErr error
+}
+
+// discoverOrigins runs origin discovery and site-data grouping against
+// client, merging their results the same way for every caller (onScan and
+// the combined refresh flow alike).
+func discoverOrigins(ctx context.Context, client *cdp.Client) (originScan, error) {
+	origins, err := scan.DiscoverOrigins(ctx, client, 0)
+	if err != nil {
+		return originScan{}, err
+	}
+
+	// DiscoverSiteData surfaces origins with storage but no cookie and no
+	// service worker at all (see scan.SourceStorage's doc comment) — a
+	// failure here shouldn't discard what DiscoverOrigins already found.
+	groups, siteDataErr := scan.DiscoverSiteData(ctx, client)
+
+	res := originScan{merged: origins, siteDataErr: siteDataErr, numGroups: len(groups)}
+	if siteDataErr == nil {
+		res.merged, res.homeGroup = scan.MergeSiteData(origins, groups)
+
+		res.groupNames = make(map[string]string, len(groups))
+		for _, g := range groups {
+			res.groupNames[g.GroupingKey] = g.DisplayName
+		}
+	}
+	return res, nil
+}
+
 func (p *OriginsPanel) scan(client *cdp.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
 	defer cancel()
 
-	origins, err := scan.DiscoverOrigins(ctx, client, 0)
+	res, err := discoverOrigins(ctx, client)
 	if err != nil {
 		fyne.Do(func() {
 			p.scanBtn.Enable()
@@ -869,37 +948,19 @@ func (p *OriginsPanel) scan(client *cdp.Client) {
 		return
 	}
 
-	// DiscoverSiteData surfaces origins with storage but no cookie and no
-	// service worker at all (see scan.SourceStorage's doc comment) — a
-	// failure here shouldn't discard what DiscoverOrigins already found.
-	groups, siteDataErr := scan.DiscoverSiteData(ctx, client)
-
-	merged := origins
-	var homeGroup, groupNames map[string]string
-	if siteDataErr == nil {
-		var withStorage []scan.Origin
-		withStorage, homeGroup = scan.MergeSiteData(origins, groups)
-		merged = withStorage
-
-		groupNames = make(map[string]string, len(groups))
-		for _, g := range groups {
-			groupNames[g.GroupingKey] = g.DisplayName
-		}
-	}
-
 	fyne.Do(func() {
 		p.scanBtn.Enable()
-		p.origins = merged
-		p.homeGroup = homeGroup
-		p.groupNames = groupNames
+		p.origins = res.merged
+		p.homeGroup = res.homeGroup
+		p.groupNames = res.groupNames
 		p.recomputeScores()
 		p.updateDeepCleanButton()
 
-		if siteDataErr != nil {
-			p.status.SetText(fmt.Sprintf("Found %d candidate origin(s). Site-data scan failed: %v", len(merged), siteDataErr))
+		if res.siteDataErr != nil {
+			p.status.SetText(fmt.Sprintf("Found %d candidate origin(s). Site-data scan failed: %v", len(res.merged), res.siteDataErr))
 			return
 		}
-		p.status.SetText(fmt.Sprintf("Found %d candidate origin(s) (%d site group(s) scanned).", len(merged), len(groups)))
+		p.status.SetText(fmt.Sprintf("Found %d candidate origin(s) (%d site group(s) scanned).", len(res.merged), res.numGroups))
 	})
 }
 
@@ -935,5 +996,72 @@ func (p *OriginsPanel) checkPermissions(client *cdp.Client) {
 			total += len(byCategory)
 		}
 		p.status.SetText(fmt.Sprintf("Found %d permission grant(s) across %d origin(s).", total, len(permissions)))
+	})
+}
+
+// onRefresh is simple mode's single entry point, replacing the manual
+// Scan/Check buttons: it runs origin discovery and a permissions check back
+// to back and reports one combined status line, so someone in simple mode
+// never has to know these are two separate CDP round trips.
+func (p *OriginsPanel) onRefresh() {
+	client := p.client
+	if client == nil {
+		return
+	}
+
+	p.refreshBtn.Disable()
+	p.status.SetText("Scanning (this will briefly switch your active Chrome tab to read site data)...")
+
+	go p.refresh(client)
+}
+
+func (p *OriginsPanel) refresh(client *cdp.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
+	defer cancel()
+
+	res, err := discoverOrigins(ctx, client)
+	if err != nil {
+		fyne.Do(func() {
+			p.refreshBtn.Enable()
+			p.status.SetText("Scan failed: " + err.Error())
+		})
+		return
+	}
+
+	fyne.Do(func() {
+		p.status.SetText("Checking permissions (this will briefly switch your active Chrome tab, once per permission type)...")
+	})
+
+	permCtx, permCancel := context.WithTimeout(context.Background(), scanTimeout)
+	defer permCancel()
+	permissions, permErr := scan.DiscoverAllPermissions(permCtx, client, scan.DefaultPermissionCategories)
+
+	fyne.Do(func() {
+		p.refreshBtn.Enable()
+		p.origins = res.merged
+		p.homeGroup = res.homeGroup
+		p.groupNames = res.groupNames
+		if permErr == nil {
+			p.permissions = permissions
+		}
+		p.recomputeScores()
+		p.updateDeepCleanButton()
+
+		msg := fmt.Sprintf("Found %d candidate origin(s)", len(res.merged))
+		if res.siteDataErr != nil {
+			msg += fmt.Sprintf(" (site-data scan failed: %v)", res.siteDataErr)
+		} else {
+			msg += fmt.Sprintf(" (%d site group(s) scanned)", res.numGroups)
+		}
+		if permErr != nil {
+			msg += fmt.Sprintf(". Checking permissions failed: %v", permErr)
+		} else {
+			total := 0
+			for _, byCategory := range permissions {
+				total += len(byCategory)
+			}
+			msg += fmt.Sprintf(". Found %d permission grant(s) across %d origin(s).", total, len(permissions))
+		}
+		p.status.SetText(msg)
 	})
 }
