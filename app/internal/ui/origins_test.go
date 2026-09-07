@@ -21,15 +21,9 @@ func TestBeginOpDisablesAllActionButtons(t *testing.T) {
 
 	p.beginOp("working...")
 
-	for name, btn := range map[string]interface{ Disabled() bool }{
-		"scanBtn":      p.scanBtn,
-		"permsBtn":     p.permsBtn,
-		"refreshBtn":   p.refreshBtn,
-		"removeBtn":    p.removeBtn,
-		"deepCleanBtn": p.deepCleanBtn,
-	} {
+	for i, btn := range p.opButtons() {
 		if !btn.Disabled() {
-			t.Errorf("%s should be disabled once an operation is in flight", name)
+			t.Errorf("opButtons()[%d] should be disabled once an operation is in flight", i)
 		}
 	}
 	if !p.busy.Visible() {
@@ -37,41 +31,46 @@ func TestBeginOpDisablesAllActionButtons(t *testing.T) {
 	}
 }
 
-// TestEndOpStaleGenerationIsNoOp verifies the fix for the stale-reconnect
-// bug: a completion from an operation superseded by a SetClient call (e.g. a
+// TestEndOpStaleClientIsNoOp verifies the fix for the stale-reconnect bug: a
+// completion from an operation superseded by a SetClient call (e.g. a
 // disconnect/reconnect while it was still running) must not clobber the
 // newer connection's button/busy state.
-func TestEndOpStaleGenerationIsNoOp(t *testing.T) {
+func TestEndOpStaleClientIsNoOp(t *testing.T) {
 	win := test.NewWindow(nil)
 	defer win.Close()
 	p := NewOriginsPanel(win)
 	p.simpleMode = false // avoid SetClient's simple-mode auto-refresh spawning a goroutine against the fake client
-	p.SetClient(&cdp.Client{})
+	staleClient := &cdp.Client{}
+	p.SetClient(staleClient)
 
-	staleGen := p.beginOp("scanning with the old client...")
+	p.beginOp("scanning with the old client...")
 
 	// Supersede it: disconnect, then reconnect with a new client, as a rapid
 	// disconnect/reconnect would in the real UI.
 	p.SetClient(nil)
 	p.SetClient(&cdp.Client{})
 
-	// The stale operation's goroutine finally completes and calls endOp.
-	p.endOp(staleGen)
+	// The stale operation's goroutine finally completes and calls endOp,
+	// still holding the client it was launched with.
+	if p.opCurrent(staleClient) {
+		t.Fatal("staleClient should no longer be current after two more SetClient calls")
+	}
+	p.endOp(staleClient)
 
 	if p.scanBtn.Disabled() {
-		t.Error("endOp with a stale generation re-enabled scanBtn, clobbering the new connection's state")
+		t.Error("endOp for a stale client re-enabled scanBtn, clobbering the new connection's state")
 	}
 	if p.busy.Visible() {
-		t.Error("endOp with a stale generation left the busy indicator visible")
+		t.Error("endOp for a stale client left the busy indicator visible")
 	}
 
 	// The current, non-stale operation still completes normally.
-	currentGen := p.beginOp("scanning with the new client...")
-	p.endOp(currentGen)
+	p.beginOp("scanning with the new client...")
+	p.endOp(p.client)
 	if p.scanBtn.Disabled() {
-		t.Error("endOp with the current generation should re-enable scanBtn")
+		t.Error("endOp for the current client should re-enable scanBtn")
 	}
 	if p.busy.Visible() {
-		t.Error("endOp with the current generation should hide the busy indicator")
+		t.Error("endOp for the current client should hide the busy indicator")
 	}
 }
