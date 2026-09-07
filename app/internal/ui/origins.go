@@ -38,6 +38,7 @@ const (
 	colCookie
 	colServiceWorker
 	colStorage
+	colStorageUsage
 	colNotifications
 	colCamera
 	colMicrophone
@@ -51,6 +52,7 @@ var columnTitles = [numCols]string{
 	colCookie:        "Cookie",
 	colServiceWorker: "Service Worker",
 	colStorage:       "Storage",
+	colStorageUsage:  "Storage Used",
 	colNotifications: "Notifications",
 	colCamera:        "Camera",
 	colMicrophone:    "Microphone",
@@ -107,6 +109,18 @@ type OriginsPanel struct {
 	homeGroup  map[string]string // origin -> groupingKey
 	groupNames map[string]string // groupingKey -> displayName, for dialog text
 
+	// usage is total on-disk storage attributed to an origin, in bytes, as
+	// chrome://settings/content/all reports it (see scan.StorageOrigin.Usage) —
+	// summed across every group entry the origin appears in, so a
+	// partitioned origin's usage under each top-level site it's embedded
+	// under is all counted, not just its unpartitioned "home" entry.
+	usage map[string]int64
+	// usageAvailable is false until a site-data scan has succeeded at
+	// least once, so the Storage Used column can show "—" (unknown)
+	// instead of a misleading "0 B" for every row when that scan hasn't
+	// run yet or failed (DESIGN.md's "degrade gracefully" principle).
+	usageAvailable bool
+
 	// actions is the running log of removal/deep-clean operations
 	// performed this session, oldest first — the basis for Save Report.
 	// Reset whenever SetClient starts a new session.
@@ -132,6 +146,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 		permissions: make(map[string]map[string]scan.PermissionStatus),
 		scores:      make(map[string]reputation.Score),
 		selected:    make(map[string]bool),
+		usage:       make(map[string]int64),
 		sortCol:     -1,
 		simpleMode:  true,
 	}
@@ -218,6 +233,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.table.SetColumnWidth(colCookie, 80)
 	p.table.SetColumnWidth(colServiceWorker, 130)
 	p.table.SetColumnWidth(colStorage, 80)
+	p.table.SetColumnWidth(colStorageUsage, 100)
 	p.table.SetColumnWidth(colNotifications, 130)
 	p.table.SetColumnWidth(colCamera, 100)
 	p.table.SetColumnWidth(colMicrophone, 110)
@@ -294,6 +310,11 @@ func (p *OriginsPanel) cellText(origin scan.Origin, col int) string {
 		return checkmark(hasSource(origin.Sources, scan.SourceServiceWorker))
 	case colStorage:
 		return checkmark(hasSource(origin.Sources, scan.SourceStorage))
+	case colStorageUsage:
+		if !p.usageAvailable {
+			return "—"
+		}
+		return formatBytes(p.usage[origin.Origin])
 	case colNotifications, colCamera, colMicrophone:
 		return string(p.permissionStatus(origin.Origin, columnCategory[col]))
 	default:
@@ -317,6 +338,24 @@ func checkmark(b bool) string {
 		return "✓"
 	}
 	return ""
+}
+
+// formatBytes renders a byte count the way a person reads storage sizes
+// (binary units, one decimal place above KB), matching what
+// chrome://settings/content/all itself shows for a site's usage. 0 renders
+// as "0 B" rather than blank, since it's a real (measured, not missing)
+// value distinct from an origin with no storage-usage data at all.
+func formatBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 func hasSource(sources []scan.Source, want scan.Source) bool {
@@ -573,6 +612,8 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	p.selected = make(map[string]bool)
 	p.homeGroup = nil
 	p.groupNames = nil
+	p.usage = make(map[string]int64)
+	p.usageAvailable = false
 	p.actions = nil
 	p.detail.SetText("Select a row to see why it was scored that way.")
 	p.filterEntry.SetText("") // triggers onFilterChanged -> applyFilter
@@ -642,10 +683,14 @@ func (p *OriginsPanel) sortOrigins() {
 }
 
 func (p *OriginsPanel) less(a, b scan.Origin) bool {
-	if p.sortCol == colScore {
+	switch p.sortCol {
+	case colScore:
 		return p.scores[a.Origin].Total < p.scores[b.Origin].Total
+	case colStorageUsage:
+		return p.usage[a.Origin] < p.usage[b.Origin]
+	default:
+		return p.sortKey(a) < p.sortKey(b)
 	}
-	return p.sortKey(a) < p.sortKey(b)
 }
 
 func (p *OriginsPanel) sortKey(o scan.Origin) string {
@@ -1046,6 +1091,7 @@ type originScan struct {
 	merged      []scan.Origin
 	homeGroup   map[string]string
 	groupNames  map[string]string
+	usage       map[string]int64
 	numGroups   int
 	siteDataErr error
 }
@@ -1069,8 +1115,12 @@ func discoverOrigins(ctx context.Context, client *cdp.Client) (originScan, error
 		res.merged, res.homeGroup = scan.MergeSiteData(origins, groups)
 
 		res.groupNames = make(map[string]string, len(groups))
+		res.usage = make(map[string]int64)
 		for _, g := range groups {
 			res.groupNames[g.GroupingKey] = g.DisplayName
+			for _, o := range g.Origins {
+				res.usage[o.Origin] += o.Usage
+			}
 		}
 	}
 	return res, nil
@@ -1093,6 +1143,10 @@ func (p *OriginsPanel) scan(client *cdp.Client) {
 		p.origins = res.merged
 		p.homeGroup = res.homeGroup
 		p.groupNames = res.groupNames
+		if res.usage != nil {
+			p.usage = res.usage
+			p.usageAvailable = true
+		}
 		p.recomputeScores()
 		defer p.endOp(client)
 
@@ -1181,6 +1235,10 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 		p.origins = res.merged
 		p.homeGroup = res.homeGroup
 		p.groupNames = res.groupNames
+		if res.usage != nil {
+			p.usage = res.usage
+			p.usageAvailable = true
+		}
 		if permErr == nil {
 			p.permissions = permissions
 		}
