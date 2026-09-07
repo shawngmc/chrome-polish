@@ -134,6 +134,12 @@ type OriginsPanel struct {
 	// Reset whenever SetClient starts a new session.
 	actions []report.Action
 
+	// originWidthCache memoizes resizeOriginColumn's per-origin measured
+	// text width (see its doc comment), invalidated whenever the theme's
+	// text size (originWidthCacheSize) changes.
+	originWidthCache     map[string]float32
+	originWidthCacheSize float32
+
 	sortCol        int // -1 if unsorted
 	sortAsc        bool
 	colorBlindMode bool
@@ -586,13 +592,31 @@ func (p *OriginsPanel) applyFilter() {
 // resizeOriginColumn sizes the Origin column to fit the longest origin
 // currently visible, so hostnames aren't clipped, within sane bounds so a
 // single very long entry can't push the column absurdly wide.
+//
+// applyFilter calls this on every filter-box keystroke, so on a busy
+// profile (1000+ candidate origins isn't unusual — see
+// cdp-remote-debugging-quirks item 6) it would otherwise re-run
+// fyne.MeasureText's font-shaping work for the same unchanged origin
+// strings over and over. originWidthCache memoizes each origin's measured
+// width (an origin string's rendered width never changes while the theme's
+// text size doesn't), so repeated filtering only measures newly-seen
+// strings.
 func (p *OriginsPanel) resizeOriginColumn() {
 	const minWidth, maxWidth = float32(150), float32(600)
 
 	textSize := theme.TextSize()
+	if p.originWidthCache == nil || p.originWidthCacheSize != textSize {
+		p.originWidthCache = make(map[string]float32, len(p.origins))
+		p.originWidthCacheSize = textSize
+	}
+
 	widest := float32(0)
 	for _, o := range p.visible {
-		w := fyne.MeasureText(o.Origin, textSize, fyne.TextStyle{}).Width
+		w, ok := p.originWidthCache[o.Origin]
+		if !ok {
+			w = fyne.MeasureText(o.Origin, textSize, fyne.TextStyle{}).Width
+			p.originWidthCache[o.Origin] = w
+		}
 		if w > widest {
 			widest = w
 		}

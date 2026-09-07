@@ -132,8 +132,14 @@ type getCookiesForDeleteResult struct {
 // cookieMatchesHost reports whether a cookie's domain attribute (as returned
 // by Storage.getCookies) covers host, matching either the exact host or, for
 // a domain cookie (Domain set on a parent domain, e.g. ".example.com"), any
-// subdomain of it.
+// subdomain of it. A host-only cookie (no leading dot) only ever matches its
+// exact host — real browser cookie scoping never sends a host-only cookie to
+// a subdomain, so a host-only cookie on a parent domain must not be treated
+// as covered by (and cleared alongside) a subdomain origin.
 func cookieMatchesHost(domain, host string) bool {
+	if !strings.HasPrefix(domain, ".") {
+		return domain == host
+	}
 	d := strings.TrimPrefix(domain, ".")
 	return d == host || strings.HasSuffix(host, "."+d)
 }
