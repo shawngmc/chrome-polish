@@ -20,6 +20,7 @@ func main() {
 	wsURL := flag.String("ws", "", "connect directly to this websocket debugger URL, skipping discovery entirely")
 	swWindow := flag.Duration("sw-window", scan.DefaultServiceWorkerWindow, "how long to listen for service worker registrations")
 	permissions := flag.Bool("permissions", false, "also read notification/camera/microphone permission grants (briefly switches your active tab, once per category)")
+	siteData := flag.Bool("site-data", false, "also read chrome://settings/content/all's site-group/storage/partition data")
 	timeout := flag.Duration("timeout", 15*time.Second, "overall timeout for the probe")
 	flag.Parse()
 
@@ -58,26 +59,43 @@ func main() {
 
 	if len(origins) == 0 {
 		fmt.Println("No candidate origins found.")
-		return
-	}
-
-	fmt.Printf("%d candidate origin(s):\n", len(origins))
-	for _, o := range origins {
-		fmt.Printf("  %-40s %v\n", o.Origin, o.Sources)
-	}
-
-	if !*permissions {
-		return
-	}
-
-	for _, category := range scan.DefaultPermissionCategories {
-		grants, err := scan.DiscoverPermissions(ctx, client, category)
-		if err != nil {
-			log.Fatalf("discover %s permissions: %v", category.Category, err)
+	} else {
+		fmt.Printf("%d candidate origin(s):\n", len(origins))
+		for _, o := range origins {
+			fmt.Printf("  %-40s %v\n", o.Origin, o.Sources)
 		}
-		fmt.Printf("\n%d %s permission grant(s):\n", len(grants), category.Category)
-		for _, g := range grants {
-			fmt.Printf("  %-40s %s\n", g.Origin, g.Status)
+	}
+
+	if *permissions {
+		for _, category := range scan.DefaultPermissionCategories {
+			grants, err := scan.DiscoverPermissions(ctx, client, category)
+			if err != nil {
+				log.Fatalf("discover %s permissions: %v", category.Category, err)
+			}
+			fmt.Printf("\n%d %s permission grant(s):\n", len(grants), category.Category)
+			for _, g := range grants {
+				fmt.Printf("  %-40s %s\n", g.Origin, g.Status)
+			}
+		}
+	}
+
+	if !*siteData {
+		return
+	}
+
+	groups, err := scan.DiscoverSiteData(ctx, client)
+	if err != nil {
+		log.Fatalf("discover site data: %v", err)
+	}
+	fmt.Printf("\n%d site group(s):\n", len(groups))
+	for _, g := range groups {
+		fmt.Printf("  %s (%d cookies)\n", g.DisplayName, g.NumCookies)
+		for _, o := range g.Origins {
+			partitioned := ""
+			if o.IsPartitioned {
+				partitioned = " [partitioned]"
+			}
+			fmt.Printf("    %-45s %8d bytes, %d cookies%s\n", o.Origin, o.Usage, o.NumCookies, partitioned)
 		}
 	}
 }

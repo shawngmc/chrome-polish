@@ -22,6 +22,11 @@ type Source string
 const (
 	SourceCookie        Source = "cookie"
 	SourceServiceWorker Source = "service-worker"
+	// SourceStorage marks an origin seen only in chrome://settings/content/
+	// all's own storage-usage data (DiscoverSiteData) — an origin with
+	// localStorage/cache/etc. usage but no cookie and no service worker,
+	// which DiscoverOrigins alone can never see.
+	SourceStorage Source = "storage"
 )
 
 // Origin is a candidate origin discovered from one or more browser-wide

@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	a := app.New()
+	a := app.NewWithID("com.github.shawngmc.chrome-polish")
 	a.SetIcon(resourceIconPng)
 	w := a.NewWindow("Chrome Polish")
 

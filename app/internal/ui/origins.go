@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	scanTimeout      = 15 * time.Second
+	scanTimeout      = 25 * time.Second
 	permissionsCheck = "Check permissions"
 )
 
@@ -36,6 +36,7 @@ const (
 	colBlocklisted
 	colCookie
 	colServiceWorker
+	colStorage
 	colNotifications
 	colCamera
 	colMicrophone
@@ -48,6 +49,7 @@ var columnTitles = [numCols]string{
 	colBlocklisted:   "Blocklisted",
 	colCookie:        "Cookie",
 	colServiceWorker: "Service Worker",
+	colStorage:       "Storage",
 	colNotifications: "Notifications",
 	colCamera:        "Camera",
 	colMicrophone:    "Microphone",
@@ -79,6 +81,7 @@ type OriginsPanel struct {
 	blocklistBtn *widget.Button
 	optionsBtn   *widget.Button
 	removeBtn    *widget.Button
+	deepCleanBtn *widget.Button
 	filterEntry  *widget.Entry
 	status       *widget.Label
 	detail       *widget.Label
@@ -91,6 +94,14 @@ type OriginsPanel struct {
 	scores      map[string]reputation.Score                 // origin -> score
 	blocklist   reputation.Blocklist
 	selected    map[string]bool // origin -> checked, for bulk removal
+
+	// homeGroup and groupNames come from the site-data half of a scan (see
+	// scan.DiscoverSiteData / scan.MergeSiteData). homeGroup maps an origin
+	// to the GroupingKey of the one SiteGroup it's a non-partitioned member
+	// of — the safe direction for a whole-site removal to key off, since a
+	// partitioned origin can be a child of many unrelated groups at once.
+	homeGroup  map[string]string // origin -> groupingKey
+	groupNames map[string]string // groupingKey -> displayName, for dialog text
 
 	sortCol        int // -1 if unsorted
 	sortAsc        bool
@@ -187,6 +198,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.table.SetColumnWidth(colBlocklisted, 100)
 	p.table.SetColumnWidth(colCookie, 80)
 	p.table.SetColumnWidth(colServiceWorker, 130)
+	p.table.SetColumnWidth(colStorage, 80)
 	p.table.SetColumnWidth(colNotifications, 130)
 	p.table.SetColumnWidth(colCamera, 100)
 	p.table.SetColumnWidth(colMicrophone, 110)
@@ -205,6 +217,10 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.removeBtn.Importance = widget.DangerImportance
 	p.removeBtn.Disable()
 
+	p.deepCleanBtn = widget.NewButton("Deep clean site(s)...", p.onDeepClean)
+	p.deepCleanBtn.Importance = widget.DangerImportance
+	p.deepCleanBtn.Disable()
+
 	p.filterEntry = widget.NewEntry()
 	p.filterEntry.SetPlaceHolder("Filter by domain...")
 	p.filterEntry.OnChanged = p.onFilterChanged
@@ -217,7 +233,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 
 	p.results = container.NewBorder(
 		container.NewBorder(nil, nil, widget.NewLabel("Filter:"), nil, p.filterEntry),
-		container.NewVBox(p.detail, p.removeBtn),
+		container.NewVBox(p.detail, p.removeBtn, p.deepCleanBtn),
 		nil, nil,
 		p.table,
 	)
@@ -249,6 +265,8 @@ func (p *OriginsPanel) cellText(origin scan.Origin, col int) string {
 		return checkmark(hasSource(origin.Sources, scan.SourceCookie))
 	case colServiceWorker:
 		return checkmark(hasSource(origin.Sources, scan.SourceServiceWorker))
+	case colStorage:
+		return checkmark(hasSource(origin.Sources, scan.SourceStorage))
 	case colNotifications, colCamera, colMicrophone:
 		return string(p.permissionStatus(origin.Origin, columnCategory[col]))
 	default:
@@ -303,6 +321,7 @@ func (p *OriginsPanel) onToggleSelect(origin string, checked bool) {
 		delete(p.selected, origin)
 	}
 	p.updateRemoveButton()
+	p.updateDeepCleanButton()
 	p.table.Refresh() // so the header "select all" checkbox reflects the change
 }
 
@@ -315,6 +334,7 @@ func (p *OriginsPanel) onToggleSelectAll(checked bool) {
 		}
 	}
 	p.updateRemoveButton()
+	p.updateDeepCleanButton()
 	p.table.Refresh()
 }
 
@@ -342,6 +362,42 @@ func (p *OriginsPanel) updateRemoveButton() {
 	p.removeBtn.SetText(fmt.Sprintf("Remove data (%d)...", n))
 	if p.client != nil {
 		p.removeBtn.Enable()
+	}
+}
+
+// selectedGroupingKeys resolves the current selection to the distinct
+// GroupingKeys of their non-partitioned home SiteGroups (see homeGroup's
+// doc comment), skipping any selected origin with no known home group.
+func (p *OriginsPanel) selectedGroupingKeys() []string {
+	seen := make(map[string]bool)
+	var keys []string
+	for origin := range p.selected {
+		key, ok := p.homeGroup[origin]
+		if !ok || seen[key] {
+			continue
+		}
+		seen[key] = true
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// updateDeepCleanButton syncs the Deep Clean button's label and enabled
+// state to how many distinct site groups the current selection resolves
+// to (see selectedGroupingKeys) — not the raw selection count, since
+// several selected origins can share one home group, and some may resolve
+// to none at all.
+func (p *OriginsPanel) updateDeepCleanButton() {
+	n := len(p.selectedGroupingKeys())
+	if n == 0 {
+		p.deepCleanBtn.SetText("Deep clean site(s)...")
+		p.deepCleanBtn.Disable()
+		return
+	}
+	p.deepCleanBtn.SetText(fmt.Sprintf("Deep clean site(s) (%d)...", n))
+	if p.client != nil {
+		p.deepCleanBtn.Enable()
 	}
 }
 
@@ -423,9 +479,12 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	p.scores = make(map[string]reputation.Score)
 	p.sortCol = -1
 	p.selected = make(map[string]bool)
+	p.homeGroup = nil
+	p.groupNames = nil
 	p.detail.SetText("Select a row to see why it was scored that way.")
 	p.filterEntry.SetText("") // triggers onFilterChanged -> applyFilter
 	p.updateRemoveButton()
+	p.updateDeepCleanButton()
 	p.table.Refresh()
 
 	if client != nil {
@@ -483,6 +542,8 @@ func (p *OriginsPanel) sortKey(o scan.Origin) string {
 		return boolKey(hasSource(o.Sources, scan.SourceCookie))
 	case colServiceWorker:
 		return boolKey(hasSource(o.Sources, scan.SourceServiceWorker))
+	case colStorage:
+		return boolKey(hasSource(o.Sources, scan.SourceStorage))
 	case colNotifications, colCamera, colMicrophone:
 		return string(p.permissionStatus(o.Origin, columnCategory[p.sortCol]))
 	default:
@@ -679,6 +740,7 @@ func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []remo
 		}
 
 		p.updateRemoveButton()
+		p.updateDeepCleanButton()
 		p.table.Refresh()
 
 		if len(failed) == 0 {
@@ -689,6 +751,99 @@ func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []remo
 	})
 }
 
+// onDeepClean opens a confirmation dialog for wholly clearing the site
+// group(s) the current selection resolves to (see selectedGroupingKeys) —
+// every origin under each group, partitioned or not, all storage types at
+// once. This is the only way to reach storage-partitioned data at all
+// (removal.ClearSiteGroup's docs explain why Storage.clearDataForOrigin
+// can't), but it's a bigger blast radius than "Remove data": it clears the
+// whole site, not just the checked origin(s), and offers no per-type
+// selection.
+func (p *OriginsPanel) onDeepClean() {
+	if len(p.selected) == 0 || p.client == nil {
+		return
+	}
+
+	keys := p.selectedGroupingKeys()
+	if len(keys) == 0 {
+		p.status.SetText("None of the selected origin(s) have a known site group to deep clean — re-scan first?")
+		return
+	}
+
+	names := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if name, ok := p.groupNames[k]; ok {
+			names = append(names, name)
+		} else {
+			names = append(names, k)
+		}
+	}
+	sort.Strings(names)
+
+	skipped := 0
+	for origin := range p.selected {
+		if _, ok := p.homeGroup[origin]; !ok {
+			skipped++
+		}
+	}
+
+	lines := []fyne.CanvasObject{
+		widget.NewLabel(fmt.Sprintf("This clears EVERYTHING for %d whole site(s) — cookies, local storage, cache, and any storage partitioned under them (e.g. third-party embeds) — not just the checked origin(s):", len(keys))),
+		widget.NewLabel(strings.Join(names, "\n")),
+	}
+	if skipped > 0 {
+		lines = append(lines, widget.NewLabel(fmt.Sprintf("%d selected origin(s) have no known site group and will be skipped.", skipped)))
+	}
+	content := container.NewVBox(lines...)
+
+	dialog.NewCustomConfirm("Deep Clean Site(s)", "Clear Everything", "Cancel", content, func(confirmed bool) {
+		if !confirmed {
+			return
+		}
+
+		p.deepCleanBtn.Disable()
+		p.status.SetText(fmt.Sprintf("Deep cleaning %d site(s)...", len(keys)))
+		go p.deepClean(p.client, keys)
+	}, p.win).Show()
+}
+
+func (p *OriginsPanel) deepClean(client *cdp.Client, groupingKeys []string) {
+	ctx, cancel := context.WithTimeout(context.Background(), removeTimeout(len(groupingKeys)))
+	defer cancel()
+
+	results := removal.ClearSiteGroups(ctx, client, groupingKeys)
+
+	fyne.Do(func() {
+		succeededKeys := make(map[string]bool, len(results))
+		succeeded := 0
+		var failed []string
+		for _, r := range results {
+			if r.Err != nil {
+				failed = append(failed, fmt.Sprintf("%s (%v)", r.GroupingKey, r.Err))
+				continue
+			}
+			succeeded++
+			succeededKeys[r.GroupingKey] = true
+		}
+
+		for origin := range p.selected {
+			if key, ok := p.homeGroup[origin]; ok && succeededKeys[key] {
+				delete(p.selected, origin)
+			}
+		}
+
+		p.updateRemoveButton()
+		p.updateDeepCleanButton()
+		p.table.Refresh()
+
+		if len(failed) == 0 {
+			p.status.SetText(fmt.Sprintf("Deep cleaned %d site(s). Re-scan to confirm.", succeeded))
+			return
+		}
+		p.status.SetText(fmt.Sprintf("Deep cleaned %d of %d site(s). Failed: %s", succeeded, len(results), strings.Join(failed, "; ")))
+	})
+}
+
 func (p *OriginsPanel) onScan() {
 	client := p.client
 	if client == nil {
@@ -696,7 +851,7 @@ func (p *OriginsPanel) onScan() {
 	}
 
 	p.scanBtn.Disable()
-	p.status.SetText("Scanning...")
+	p.status.SetText("Scanning (this will briefly switch your active Chrome tab to read site data)...")
 
 	go p.scan(client)
 }
@@ -706,16 +861,45 @@ func (p *OriginsPanel) scan(client *cdp.Client) {
 	defer cancel()
 
 	origins, err := scan.DiscoverOrigins(ctx, client, 0)
+	if err != nil {
+		fyne.Do(func() {
+			p.scanBtn.Enable()
+			p.status.SetText("Scan failed: " + err.Error())
+		})
+		return
+	}
+
+	// DiscoverSiteData surfaces origins with storage but no cookie and no
+	// service worker at all (see scan.SourceStorage's doc comment) — a
+	// failure here shouldn't discard what DiscoverOrigins already found.
+	groups, siteDataErr := scan.DiscoverSiteData(ctx, client)
+
+	merged := origins
+	var homeGroup, groupNames map[string]string
+	if siteDataErr == nil {
+		var withStorage []scan.Origin
+		withStorage, homeGroup = scan.MergeSiteData(origins, groups)
+		merged = withStorage
+
+		groupNames = make(map[string]string, len(groups))
+		for _, g := range groups {
+			groupNames[g.GroupingKey] = g.DisplayName
+		}
+	}
 
 	fyne.Do(func() {
 		p.scanBtn.Enable()
-		if err != nil {
-			p.status.SetText("Scan failed: " + err.Error())
+		p.origins = merged
+		p.homeGroup = homeGroup
+		p.groupNames = groupNames
+		p.recomputeScores()
+		p.updateDeepCleanButton()
+
+		if siteDataErr != nil {
+			p.status.SetText(fmt.Sprintf("Found %d candidate origin(s). Site-data scan failed: %v", len(merged), siteDataErr))
 			return
 		}
-		p.origins = origins
-		p.recomputeScores()
-		p.status.SetText(fmt.Sprintf("Found %d candidate origin(s).", len(origins)))
+		p.status.SetText(fmt.Sprintf("Found %d candidate origin(s) (%d site group(s) scanned).", len(merged), len(groups)))
 	})
 }
 
