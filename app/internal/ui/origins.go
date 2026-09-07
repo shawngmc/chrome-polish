@@ -19,6 +19,7 @@ import (
 
 	"github.com/shawngmc/chrome-polish/app/internal/cdp"
 	"github.com/shawngmc/chrome-polish/app/internal/removal"
+	"github.com/shawngmc/chrome-polish/app/internal/report"
 	"github.com/shawngmc/chrome-polish/app/internal/reputation"
 	"github.com/shawngmc/chrome-polish/app/internal/scan"
 )
@@ -83,6 +84,7 @@ type OriginsPanel struct {
 	optionsBtn   *widget.Button
 	removeBtn    *widget.Button
 	deepCleanBtn *widget.Button
+	reportBtn    *widget.Button
 	filterEntry  *widget.Entry
 	status       *widget.Label
 	busy         *widget.ProgressBarInfinite
@@ -104,6 +106,11 @@ type OriginsPanel struct {
 	// partitioned origin can be a child of many unrelated groups at once.
 	homeGroup  map[string]string // origin -> groupingKey
 	groupNames map[string]string // groupingKey -> displayName, for dialog text
+
+	// actions is the running log of removal/deep-clean operations
+	// performed this session, oldest first — the basis for Save Report.
+	// Reset whenever SetClient starts a new session.
+	actions []report.Action
 
 	sortCol        int // -1 if unsorted
 	sortAsc        bool
@@ -236,12 +243,15 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.deepCleanBtn.Importance = widget.DangerImportance
 	p.deepCleanBtn.Disable()
 
+	p.reportBtn = widget.NewButton("Save report...", p.onSaveReport)
+	p.reportBtn.Disable()
+
 	p.filterEntry = widget.NewEntry()
 	p.filterEntry.SetPlaceHolder("Filter by domain...")
 	p.filterEntry.OnChanged = p.onFilterChanged
 
 	p.controls = container.NewVBox(
-		p.scanBtn, p.permsBtn, p.refreshBtn, p.blocklistBtn, p.optionsBtn,
+		p.scanBtn, p.permsBtn, p.refreshBtn, p.blocklistBtn, p.optionsBtn, p.reportBtn,
 		widget.NewSeparator(),
 		p.busy,
 		p.status,
@@ -418,6 +428,17 @@ func (p *OriginsPanel) updateDeepCleanButton() {
 	}
 }
 
+// updateReportButton enables Save Report once there's anything worth
+// writing down: a completed scan, or an action taken (a report from an
+// action-only session, with no scan re-run since, is still meaningful).
+func (p *OriginsPanel) updateReportButton() {
+	if len(p.origins) > 0 || len(p.actions) > 0 {
+		p.reportBtn.Enable()
+		return
+	}
+	p.reportBtn.Disable()
+}
+
 func (p *OriginsPanel) countBlocklisted() int {
 	n := 0
 	for _, o := range p.origins {
@@ -552,10 +573,12 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	p.selected = make(map[string]bool)
 	p.homeGroup = nil
 	p.groupNames = nil
+	p.actions = nil
 	p.detail.SetText("Select a row to see why it was scored that way.")
 	p.filterEntry.SetText("") // triggers onFilterChanged -> applyFilter
 	p.updateRemoveButton()
 	p.updateDeepCleanButton()
+	p.updateReportButton()
 	p.table.Refresh()
 
 	if client != nil {
@@ -669,6 +692,7 @@ func (p *OriginsPanel) recomputeScores() {
 	p.sortOrigins()
 	p.applyFilter()
 	p.table.Refresh()
+	p.updateReportButton()
 }
 
 func (p *OriginsPanel) showDetail(row int) {
@@ -750,6 +774,43 @@ func (p *OriginsPanel) onLoadBlocklist() {
 	}, p.win)
 }
 
+// onSaveReport writes a plain-text summary of the session (scored origins
+// plus every removal/deep-clean action taken) to a file the person picks —
+// meant to be left with them as a record, per DESIGN.md's one-on-one
+// tech-support framing. Pure local file I/O over already-collected state;
+// it doesn't touch the CDP client, so it's available even mid-operation.
+func (p *OriginsPanel) onSaveReport() {
+	scores := make([]reputation.Score, 0, len(p.scores))
+	for _, s := range p.scores {
+		scores = append(scores, s)
+	}
+
+	text := report.Generate(report.Input{
+		GeneratedAt: time.Now(),
+		Scores:      scores,
+		Actions:     p.actions,
+	})
+
+	save := dialog.NewFileSave(func(writer fyne.URIWriteCloser, err error) {
+		if err != nil {
+			dialog.ShowError(err, p.win)
+			return
+		}
+		if writer == nil {
+			return // cancelled
+		}
+		defer writer.Close()
+
+		if _, err := writer.Write([]byte(text)); err != nil {
+			dialog.ShowError(err, p.win)
+			return
+		}
+		p.status.SetText("Saved session report to " + writer.URI().Name() + ".")
+	}, p.win)
+	save.SetFileName(fmt.Sprintf("chrome-polish-report-%s.txt", time.Now().Format("20060102-150405")))
+	save.Show()
+}
+
 // onRemove opens a confirmation dialog for clearing the checked origins'
 // data, letting the person pick exactly which storage types to clear
 // (DESIGN.md section 4.3: precise, per-type removal, never a blanket
@@ -827,6 +888,12 @@ func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []remo
 
 	results := removal.ClearOrigins(ctx, client, origins, types)
 
+	typeNames := make([]string, len(types))
+	for i, t := range types {
+		typeNames[i] = string(t)
+	}
+	now := time.Now()
+
 	fyne.Do(func() {
 		if !p.opCurrent(client) {
 			return
@@ -836,6 +903,9 @@ func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []remo
 		succeeded := 0
 		var failed []string
 		for _, r := range results {
+			p.actions = append(p.actions, report.Action{
+				Time: now, Kind: "Removed data", Target: r.Origin, Types: typeNames, Err: r.Err,
+			})
 			if r.Err != nil {
 				failed = append(failed, fmt.Sprintf("%s (%v)", r.Origin, r.Err))
 				continue
@@ -845,6 +915,7 @@ func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []remo
 		}
 
 		p.table.Refresh()
+		p.updateReportButton()
 
 		if len(failed) == 0 {
 			p.status.SetText(fmt.Sprintf("Cleared data for %d origin(s). Re-scan to confirm.", succeeded))
@@ -914,6 +985,7 @@ func (p *OriginsPanel) deepClean(client *cdp.Client, groupingKeys []string) {
 	defer cancel()
 
 	results := removal.ClearSiteGroups(ctx, client, groupingKeys)
+	now := time.Now()
 
 	fyne.Do(func() {
 		if !p.opCurrent(client) {
@@ -925,6 +997,13 @@ func (p *OriginsPanel) deepClean(client *cdp.Client, groupingKeys []string) {
 		succeeded := 0
 		var failed []string
 		for _, r := range results {
+			name := r.GroupingKey
+			if n, ok := p.groupNames[r.GroupingKey]; ok {
+				name = n
+			}
+			p.actions = append(p.actions, report.Action{
+				Time: now, Kind: "Deep cleaned site", Target: name, Err: r.Err,
+			})
 			if r.Err != nil {
 				failed = append(failed, fmt.Sprintf("%s (%v)", r.GroupingKey, r.Err))
 				continue
@@ -940,6 +1019,7 @@ func (p *OriginsPanel) deepClean(client *cdp.Client, groupingKeys []string) {
 		}
 
 		p.table.Refresh()
+		p.updateReportButton()
 
 		if len(failed) == 0 {
 			p.status.SetText(fmt.Sprintf("Deep cleaned %d site(s). Re-scan to confirm.", succeeded))
