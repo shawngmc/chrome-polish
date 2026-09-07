@@ -22,6 +22,18 @@ const (
 	modeWSURL = "Paste WebSocket URL"
 )
 
+// Preferences keys the connection panel persists across launches (via
+// fyne.CurrentApp().Preferences(), backed by each OS's normal per-app
+// settings storage). The pasted websocket URL (modeWSURL) is deliberately
+// not among them: it embeds a per-launch target ID (see
+// cdp-remote-debugging-quirks) that goes stale the moment Chrome restarts,
+// so remembering it would just hand back a URL that no longer resolves.
+const (
+	prefConnectMode    = "connect.mode"
+	prefConnectBrowser = "connect.browser"
+	prefConnectAddr    = "connect.addr"
+)
+
 // ConnectPanel is the connection panel from DESIGN.md section 4: pick a
 // local browser, a relay host:port, or paste a websocket debugger URL
 // directly, then connect over CDP.
@@ -45,26 +57,35 @@ type ConnectPanel struct {
 	OnDisconnected func()
 }
 
-// NewConnectPanel builds a ready-to-use connection panel.
+// NewConnectPanel builds a ready-to-use connection panel, restoring the
+// last-used connection mode, browser, and host:port from Preferences (see
+// the pref* constants above) so a returning session doesn't start from
+// scratch.
 func NewConnectPanel() *ConnectPanel {
 	p := &ConnectPanel{}
+	prefs := fyne.CurrentApp().Preferences()
 
 	p.browserSelect = widget.NewSelect(
 		[]string{string(cdp.BrowserChrome), string(cdp.BrowserBrave), string(cdp.BrowserEdge), string(cdp.BrowserVivaldi)},
-		nil,
+		func(browser string) { prefs.SetString(prefConnectBrowser, browser) },
 	)
-	p.browserSelect.SetSelected(string(cdp.BrowserChrome))
+	p.browserSelect.SetSelected(prefs.StringWithFallback(prefConnectBrowser, string(cdp.BrowserChrome)))
 
 	p.addrEntry = widget.NewEntry()
 	p.addrEntry.SetPlaceHolder("127.0.0.1:9222 or relay-host:12345")
+	p.addrEntry.SetText(prefs.String(prefConnectAddr))
+	p.addrEntry.OnChanged = func(addr string) { prefs.SetString(prefConnectAddr, addr) }
 	p.addrEntry.Hide()
 
 	p.wsEntry = widget.NewEntry()
 	p.wsEntry.SetPlaceHolder("ws://127.0.0.1:9222/devtools/browser/...")
 	p.wsEntry.Hide()
 
-	p.modeSelect = widget.NewSelect([]string{modeLocal, modeAddr, modeWSURL}, p.onModeChanged)
-	p.modeSelect.SetSelected(modeLocal)
+	p.modeSelect = widget.NewSelect([]string{modeLocal, modeAddr, modeWSURL}, func(mode string) {
+		p.onModeChanged(mode)
+		prefs.SetString(prefConnectMode, mode)
+	})
+	p.modeSelect.SetSelected(prefs.StringWithFallback(prefConnectMode, modeLocal))
 
 	p.status = widget.NewLabel("Not connected.")
 	p.status.Wrapping = fyne.TextWrapWord

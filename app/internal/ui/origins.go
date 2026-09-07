@@ -29,6 +29,14 @@ const (
 	permissionsCheck = "Check permissions"
 )
 
+// Preferences keys the origins panel persists across launches via
+// fyne.CurrentApp().Preferences() (see ConnectPanel's pref* constants for
+// the same pattern applied to connection settings).
+const (
+	prefColorBlindMode = "options.colorBlindMode"
+	prefSimpleMode     = "options.simpleMode"
+)
+
 // origins table columns.
 const (
 	colSelect = iota
@@ -141,14 +149,16 @@ type OriginsPanel struct {
 // client attached; call SetClient once a connection is established. win is
 // used to anchor the blocklist file-picker dialog.
 func NewOriginsPanel(win fyne.Window) *OriginsPanel {
+	prefs := fyne.CurrentApp().Preferences()
 	p := &OriginsPanel{
-		win:         win,
-		permissions: make(map[string]map[string]scan.PermissionStatus),
-		scores:      make(map[string]reputation.Score),
-		selected:    make(map[string]bool),
-		usage:       make(map[string]int64),
-		sortCol:     -1,
-		simpleMode:  true,
+		win:            win,
+		permissions:    make(map[string]map[string]scan.PermissionStatus),
+		scores:         make(map[string]reputation.Score),
+		selected:       make(map[string]bool),
+		usage:          make(map[string]int64),
+		sortCol:        -1,
+		simpleMode:     prefs.BoolWithFallback(prefSimpleMode, true),
+		colorBlindMode: prefs.Bool(prefColorBlindMode),
 	}
 
 	p.status = widget.NewLabel("Connect first, then scan for candidate origins.")
@@ -771,14 +781,18 @@ func (p *OriginsPanel) scoreColor(score int) color.Color {
 }
 
 func (p *OriginsPanel) onOptions() {
+	prefs := fyne.CurrentApp().Preferences()
+
 	colorBlindCheck := widget.NewCheck("Color-blind friendly score colors", func(checked bool) {
 		p.colorBlindMode = checked
+		prefs.SetBool(prefColorBlindMode, checked)
 		p.table.Refresh()
 	})
 	colorBlindCheck.SetChecked(p.colorBlindMode)
 
 	advancedCheck := widget.NewCheck("Advanced mode (manual scan and permission checks)", func(checked bool) {
 		p.simpleMode = !checked
+		prefs.SetBool(prefSimpleMode, p.simpleMode)
 		p.applyMode()
 	})
 	advancedCheck.SetChecked(!p.simpleMode)
