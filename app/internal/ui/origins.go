@@ -85,6 +85,7 @@ type OriginsPanel struct {
 	deepCleanBtn *widget.Button
 	filterEntry  *widget.Entry
 	status       *widget.Label
+	busy         *widget.ProgressBarInfinite
 	detail       *widget.Label
 	table        *widget.Table
 
@@ -130,6 +131,9 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 
 	p.status = widget.NewLabel("Connect first, then scan for candidate origins.")
 	p.status.Wrapping = fyne.TextWrapWord
+
+	p.busy = widget.NewProgressBarInfinite()
+	p.busy.Hide()
 
 	p.detail = widget.NewLabel("Select a row to see why it was scored that way.")
 	p.detail.Wrapping = fyne.TextWrapWord
@@ -239,6 +243,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.controls = container.NewVBox(
 		p.scanBtn, p.permsBtn, p.refreshBtn, p.blocklistBtn, p.optionsBtn,
 		widget.NewSeparator(),
+		p.busy,
 		p.status,
 	)
 	p.applyMode()
@@ -423,6 +428,19 @@ func (p *OriginsPanel) countBlocklisted() int {
 	return n
 }
 
+// setBusy shows or hides the indeterminate progress bar that marks a scan,
+// permission check, or removal in flight. Callers on a goroutine must wrap
+// this in fyne.Do.
+func (p *OriginsPanel) setBusy(busy bool) {
+	if busy {
+		p.busy.Show()
+		p.busy.Start()
+		return
+	}
+	p.busy.Stop()
+	p.busy.Hide()
+}
+
 func pluralize(n int, singular, plural string) string {
 	if n == 1 {
 		return singular
@@ -506,6 +524,7 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 		if p.simpleMode {
 			p.refreshBtn.Disable()
 			p.status.SetText("Connected. Scanning (this will briefly switch your active Chrome tab to read site data)...")
+			p.setBusy(true)
 			go p.refresh(client)
 		} else {
 			p.status.SetText("Connected. Ready to scan.")
@@ -753,6 +772,7 @@ func (p *OriginsPanel) onRemove() {
 
 		p.removeBtn.Disable()
 		p.status.SetText(fmt.Sprintf("Removing data for %d origin(s)...", len(origins)))
+		p.setBusy(true)
 		go p.remove(p.client, origins, selectedTypes)
 	}, p.win).Show()
 }
@@ -770,6 +790,7 @@ func (p *OriginsPanel) remove(client *cdp.Client, origins []string, types []remo
 	results := removal.ClearOrigins(ctx, client, origins, types)
 
 	fyne.Do(func() {
+		p.setBusy(false)
 		succeeded := 0
 		var failed []string
 		for _, r := range results {
@@ -845,6 +866,7 @@ func (p *OriginsPanel) onDeepClean() {
 
 		p.deepCleanBtn.Disable()
 		p.status.SetText(fmt.Sprintf("Deep cleaning %d site(s)...", len(keys)))
+		p.setBusy(true)
 		go p.deepClean(p.client, keys)
 	}, p.win).Show()
 }
@@ -856,6 +878,7 @@ func (p *OriginsPanel) deepClean(client *cdp.Client, groupingKeys []string) {
 	results := removal.ClearSiteGroups(ctx, client, groupingKeys)
 
 	fyne.Do(func() {
+		p.setBusy(false)
 		succeededKeys := make(map[string]bool, len(results))
 		succeeded := 0
 		var failed []string
@@ -894,6 +917,7 @@ func (p *OriginsPanel) onScan() {
 
 	p.scanBtn.Disable()
 	p.status.SetText("Scanning (this will briefly switch your active Chrome tab to read site data)...")
+	p.setBusy(true)
 
 	go p.scan(client)
 }
@@ -942,6 +966,7 @@ func (p *OriginsPanel) scan(client *cdp.Client) {
 	res, err := discoverOrigins(ctx, client)
 	if err != nil {
 		fyne.Do(func() {
+			p.setBusy(false)
 			p.scanBtn.Enable()
 			p.status.SetText("Scan failed: " + err.Error())
 		})
@@ -949,6 +974,7 @@ func (p *OriginsPanel) scan(client *cdp.Client) {
 	}
 
 	fyne.Do(func() {
+		p.setBusy(false)
 		p.scanBtn.Enable()
 		p.origins = res.merged
 		p.homeGroup = res.homeGroup
@@ -972,6 +998,7 @@ func (p *OriginsPanel) onCheckPermissions() {
 
 	p.permsBtn.Disable()
 	p.status.SetText("Checking permissions (this will briefly switch your active Chrome tab, once per permission type)...")
+	p.setBusy(true)
 
 	go p.checkPermissions(client)
 }
@@ -983,6 +1010,7 @@ func (p *OriginsPanel) checkPermissions(client *cdp.Client) {
 	permissions, err := scan.DiscoverAllPermissions(ctx, client, scan.DefaultPermissionCategories)
 
 	fyne.Do(func() {
+		p.setBusy(false)
 		p.permsBtn.Enable()
 		if err != nil {
 			p.status.SetText("Checking permissions failed: " + err.Error())
@@ -1011,6 +1039,7 @@ func (p *OriginsPanel) onRefresh() {
 
 	p.refreshBtn.Disable()
 	p.status.SetText("Scanning (this will briefly switch your active Chrome tab to read site data)...")
+	p.setBusy(true)
 
 	go p.refresh(client)
 }
@@ -1022,6 +1051,7 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 	res, err := discoverOrigins(ctx, client)
 	if err != nil {
 		fyne.Do(func() {
+			p.setBusy(false)
 			p.refreshBtn.Enable()
 			p.status.SetText("Scan failed: " + err.Error())
 		})
@@ -1037,6 +1067,7 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 	permissions, permErr := scan.DiscoverAllPermissions(permCtx, client, scan.DefaultPermissionCategories)
 
 	fyne.Do(func() {
+		p.setBusy(false)
 		p.refreshBtn.Enable()
 		p.origins = res.merged
 		p.homeGroup = res.homeGroup
