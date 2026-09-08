@@ -42,44 +42,74 @@ const DefaultHistoryBudget = 20 * time.Second
 const lastVisitedScript = `
 (async function(budgetMs) {
 ` + findByTagScript + `
-  var el = findByTag(document.documentElement, 'history-query-manager');
-  if (!el) return JSON.stringify({error: 'history-query-manager not found'});
-
-  function waitIdle() {
+  // Polls for history-query-manager rather than assuming the caller waited
+  // long enough after navigation: faster than a flat pre-sleep when the
+  // page is already up, and more robust than one when it isn't (a slow
+  // profile/machine gets extra time instead of a hard failure). Waits for
+  // queryState/queryResult specifically, not just the element itself — on
+  // a large/slow profile the custom element can be upgraded and present
+  // in the DOM before those observables are initialized, and reading them
+  // too early throws.
+  function waitForEl(tag, timeoutMs) {
     return new Promise(function(resolve) {
+      var start = Date.now();
       (function check() {
-        if (!el.queryState.querying) resolve();
-        else setTimeout(check, 15);
+        var el = findByTag(document.documentElement, tag);
+        if (el && el.queryState && el.queryResult) return resolve(el);
+        if (Date.now() - start > timeoutMs) return resolve(null);
+        setTimeout(check, 50);
       })();
     });
   }
 
-  var lastVisit = {};
-  function ingest(entries) {
-    for (var i = 0; i < entries.length; i++) {
-      var e = entries[i];
-      var origin;
-      try { origin = new URL(e.url).origin; } catch (err) { continue; }
-      if (!(origin in lastVisit) || e.time > lastVisit[origin]) lastVisit[origin] = e.time;
-    }
-  }
+  // Runtime.evaluate's handling of a rejected awaited promise doesn't
+  // reliably surface as exceptionDetails on the Go side — a stray
+  // exception here can come back as a non-string result.value that fails
+  // to decode entirely. Converting any unexpected failure into the same
+  // {error: ...} shape as a known failure (history-query-manager not
+  // found) keeps every failure mode reaching Go as valid, decodable JSON.
+  try {
+    var el = await waitForEl('history-query-manager', 5000);
+    if (!el) return JSON.stringify({error: 'history-query-manager not found'});
 
-  var start = Date.now();
-  await waitIdle();
-  ingest(el.queryResult.value || []);
+    var waitIdle = function() {
+      return new Promise(function(resolve) {
+        (function check() {
+          if (!el.queryState.querying) resolve();
+          else setTimeout(check, 15);
+        })();
+      });
+    };
 
-  var truncated = false;
-  while (!el.queryResult.info.finished) {
-    if (Date.now() - start > budgetMs) {
-      truncated = true;
-      break;
-    }
-    el.queryHistory_(true);
+    var lastVisit = {};
+    var ingest = function(entries) {
+      for (var i = 0; i < entries.length; i++) {
+        var e = entries[i];
+        var origin;
+        try { origin = new URL(e.url).origin; } catch (err) { continue; }
+        if (!(origin in lastVisit) || e.time > lastVisit[origin]) lastVisit[origin] = e.time;
+      }
+    };
+
+    var start = Date.now();
     await waitIdle();
     ingest(el.queryResult.value || []);
-  }
 
-  return JSON.stringify({lastVisit: lastVisit, truncated: truncated});
+    var truncated = false;
+    while (!el.queryResult.info.finished) {
+      if (Date.now() - start > budgetMs) {
+        truncated = true;
+        break;
+      }
+      el.queryHistory_(true);
+      await waitIdle();
+      ingest(el.queryResult.value || []);
+    }
+
+    return JSON.stringify({lastVisit: lastVisit, truncated: truncated});
+  } catch (err) {
+    return JSON.stringify({error: String((err && err.message) || err)});
+  }
 })(%d)
 `
 
@@ -111,12 +141,6 @@ func DiscoverLastVisited(ctx context.Context, client *cdp.Client, budget time.Du
 		return nil, fmt.Errorf("scan: %w", err)
 	}
 	defer cleanup()
-
-	select {
-	case <-time.After(1 * time.Second):
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
 
 	script := fmt.Sprintf(lastVisitedScript, budget.Milliseconds())
 

@@ -54,12 +54,18 @@ const allSitesURL = "chrome://settings/content/all"
 // convention only, not real encapsulation) Polymer/Lit property, so this is
 // still reading application state through its normal JS object model, not
 // crossing a closed shadow boundary or driving synthetic UI input.
+
 // findByTagScript is a recursive by-tag element finder shared by every
 // in-page script that needs to locate a custom element regardless of how
 // deep it's nested under shadow roots (see allSitesDataScript and
-// history.go's lastVisitedScript).
+// history.go's lastVisitedScript). root can be null — most visibly when a
+// caller polls it against document.documentElement, which is transiently
+// null while a navigation is replacing the document — so callers never see
+// an exception from a mid-transition call, just a "not found" result to
+// retry.
 const findByTagScript = `
   function findByTag(root, tag) {
+    if (!root) return null;
     if (root.tagName && root.tagName.toLowerCase() === tag) return root;
     var kids = root.shadowRoot ? Array.from(root.shadowRoot.children).concat(Array.from(root.children)) : Array.from(root.children || []);
     for (var i = 0; i < kids.length; i++) {
