@@ -7,6 +7,29 @@ profile and without ever loading the suspected-malicious pages.
 
 See [DESIGN.md](./DESIGN.md) for the full architecture and rationale.
 
+## In-Chrome debugging setup
+
+Chrome Polish connects to an already-running Chrome/Chromium profile over
+the DevTools Protocol — no relaunch, no separate `--user-data-dir`. From
+inside the browser you want to clean up (Chrome/Brave/Edge/Vivaldi 144+),
+go to:
+
+```
+chrome://inspect/#remote-debugging
+```
+
+and check **"Allow remote debugging for this browser instance."** Chrome
+will show a permission dialog on each new connection request and a
+persistent "being controlled by automated test software" banner while a
+session is active.
+
+Then, in Chrome Polish, connect to `127.0.0.1:<port>` (local mode) — or
+see the [Remote Sessions
+docs](docs/content/docs/remote-sessions.md) for connecting from a
+different machine, e.g. a ChromeOS target. Uncheck the remote-debugging
+toggle when you're done. See [Getting
+Started](docs/content/docs/getting-started.md) for the full walkthrough.
+
 ## Layout
 
 This is a monorepo with three parts:
