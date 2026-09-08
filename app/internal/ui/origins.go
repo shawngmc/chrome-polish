@@ -143,14 +143,23 @@ type OriginsPanel struct {
 	// as "—".
 	lastVisited map[string]time.Time
 
+	// extensionNames is each installed extension's display name, from
+	// scan.DiscoverExtensionNames (chrome://extensions-internals), keyed
+	// by the ID that appears as a chrome-extension:// origin's host. Used
+	// by cellText to show "Extension: <name> (<id>)" for the
+	// Origin column instead of the bare chrome-extension://<id> origin —
+	// an extension ID absent from this map (unresolved, or not an
+	// extension at all) just falls back to the raw origin string.
+	extensionNames map[string]string
+
 	// actions is the running log of removal/deep-clean operations
 	// performed this session, oldest first — the basis for Save Report.
 	// Reset whenever SetClient starts a new session.
 	actions []report.Action
 
-	// originWidthCache memoizes resizeOriginColumn's per-origin measured
-	// text width (see its doc comment), invalidated whenever the theme's
-	// text size (originWidthCacheSize) changes.
+	// originWidthCache memoizes resizeOriginColumn's per-rendered-text
+	// measured width (see its doc comment), invalidated whenever the
+	// theme's text size (originWidthCacheSize) changes.
 	originWidthCache     map[string]float32
 	originWidthCacheSize float32
 
@@ -184,6 +193,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 		selected:       make(map[string]bool),
 		usage:          make(map[string]int64),
 		lastVisited:    make(map[string]time.Time),
+		extensionNames: make(map[string]string),
 		sortCol:        -1,
 		focusedRow:     -1,
 		simpleMode:     prefs.BoolWithFallback(prefSimpleMode, true),
@@ -353,6 +363,11 @@ func (p *OriginsPanel) Results() fyne.CanvasObject {
 func (p *OriginsPanel) cellText(origin scan.Origin, col int) string {
 	switch col {
 	case colOrigin:
+		if id, ok := scan.ExtensionID(origin.Origin); ok {
+			if name, ok := p.extensionNames[id]; ok {
+				return fmt.Sprintf("Extension: %s (%s)", name, id)
+			}
+		}
 		return origin.Origin
 	case colScore:
 		return strconv.Itoa(p.scores[origin.Origin].Total)
@@ -651,13 +666,18 @@ func (p *OriginsPanel) clampRowFocus() {
 // applyFilter calls this on every filter-box keystroke, so on a busy
 // profile (1000+ candidate origins isn't unusual — see
 // cdp-remote-debugging-quirks item 6) it would otherwise re-run
-// fyne.MeasureText's font-shaping work for the same unchanged origin
-// strings over and over. originWidthCache memoizes each origin's measured
-// width (an origin string's rendered width never changes while the theme's
-// text size doesn't), so repeated filtering only measures newly-seen
-// strings.
+// fyne.MeasureText's font-shaping work for the same unchanged rendered
+// text over and over. Measures cellText's Origin-column output rather
+// than the raw origin string, so a resolved extension name ("Extension:
+// <name> (<id>)") sizes the column correctly instead of the shorter bare
+// origin undercounting it. originWidthCache memoizes each rendered
+// string's measured width, keyed by that string itself — so an origin
+// whose displayed text later changes (e.g. an extension name resolving
+// after a rescan) naturally gets remeasured under its new key rather than
+// reusing a stale width — and never needs invalidating except when the
+// theme's text size changes.
 func (p *OriginsPanel) resizeOriginColumn() {
-	const minWidth, maxWidth = float32(150), float32(600)
+	const minWidth, maxWidth = float32(150), float32(750)
 
 	textSize := theme.TextSize()
 	if p.originWidthCache == nil || p.originWidthCacheSize != textSize {
@@ -667,10 +687,11 @@ func (p *OriginsPanel) resizeOriginColumn() {
 
 	widest := float32(0)
 	for _, o := range p.visible {
-		w, ok := p.originWidthCache[o.Origin]
+		text := p.cellText(o, colOrigin)
+		w, ok := p.originWidthCache[text]
 		if !ok {
-			w = fyne.MeasureText(o.Origin, textSize, fyne.TextStyle{}).Width
-			p.originWidthCache[o.Origin] = w
+			w = fyne.MeasureText(text, textSize, fyne.TextStyle{}).Width
+			p.originWidthCache[text] = w
 		}
 		if w > widest {
 			widest = w
@@ -705,6 +726,7 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	p.usage = make(map[string]int64)
 	p.usageAvailable = false
 	p.lastVisited = make(map[string]time.Time)
+	p.extensionNames = make(map[string]string)
 	p.actions = nil
 	p.detail.SetText("Select a row to see why it was scored that way.")
 	p.filterEntry.SetText("") // triggers onFilterChanged -> applyFilter
@@ -1241,11 +1263,14 @@ type originScan struct {
 	siteDataErr    error
 	lastVisited    map[string]time.Time
 	lastVisitedErr error
+	extensionNames map[string]string
+	extensionsErr  error
 }
 
-// discoverOrigins runs origin discovery, site-data grouping, and a
-// last-visited history scan against client, merging their results the same
-// way for every caller (onScan and the combined refresh flow alike).
+// discoverOrigins runs origin discovery, site-data grouping, a
+// last-visited history scan, and an extension-name lookup against client,
+// merging their results the same way for every caller (onScan and the
+// combined refresh flow alike).
 func discoverOrigins(ctx context.Context, client *cdp.Client) (originScan, error) {
 	origins, err := scan.DiscoverOrigins(ctx, client, 0)
 	if err != nil {
@@ -1279,6 +1304,15 @@ func discoverOrigins(ctx context.Context, client *cdp.Client) (originScan, error
 	res.lastVisitedErr = lastVisitedErr
 	if lastVisitedErr == nil {
 		res.lastVisited = lastVisited
+	}
+
+	// A failure here shouldn't discard origins/site-data/history already
+	// found — an unresolved extension name just falls back to showing the
+	// raw chrome-extension:// origin (see cellText).
+	extensionNames, extensionsErr := scan.DiscoverExtensionNames(ctx, client)
+	res.extensionsErr = extensionsErr
+	if extensionsErr == nil {
+		res.extensionNames = extensionNames
 	}
 
 	return res, nil
@@ -1319,12 +1353,16 @@ func (p *OriginsPanel) scan(client *cdp.Client) {
 		if res.lastVisited != nil {
 			p.lastVisited = res.lastVisited
 		}
+		if res.extensionNames != nil {
+			p.extensionNames = res.extensionNames
+		}
 		p.recomputeScores()
 		defer p.endOp(client)
 
 		msg := fmt.Sprintf("Found %d candidate origin(s)", len(res.merged))
 		msg = appendScanStep(msg, res.siteDataErr, "site-data", "%d site group(s) scanned", res.numGroups)
 		msg = appendScanStep(msg, res.lastVisitedErr, "last-visited", "%d with a last-visited time", len(res.lastVisited))
+		msg = appendScanStep(msg, res.extensionsErr, "extension name", "%d extension name(s) resolved", len(res.extensionNames))
 		p.status.SetText(msg + ".")
 	})
 }
@@ -1413,6 +1451,9 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 		if res.lastVisited != nil {
 			p.lastVisited = res.lastVisited
 		}
+		if res.extensionNames != nil {
+			p.extensionNames = res.extensionNames
+		}
 		if permErr == nil {
 			p.permissions = permissions
 		}
@@ -1421,6 +1462,7 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 		msg := fmt.Sprintf("Found %d candidate origin(s)", len(res.merged))
 		msg = appendScanStep(msg, res.siteDataErr, "site-data", "%d site group(s) scanned", res.numGroups)
 		msg = appendScanStep(msg, res.lastVisitedErr, "last-visited", "%d with a last-visited time", len(res.lastVisited))
+		msg = appendScanStep(msg, res.extensionsErr, "extension name", "%d extension name(s) resolved", len(res.extensionNames))
 		if permErr != nil {
 			msg += fmt.Sprintf(". Checking permissions failed: %v", permErr)
 		} else {

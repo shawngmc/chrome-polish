@@ -22,6 +22,7 @@ func main() {
 	permissions := flag.Bool("permissions", false, "also read notification/camera/microphone permission grants (briefly switches your active tab, once per category)")
 	siteData := flag.Bool("site-data", false, "also read chrome://settings/content/all's site-group/storage/partition data")
 	lastVisited := flag.Bool("last-visited", false, "also read chrome://history's per-origin last-visit times")
+	extensions := flag.Bool("extensions", false, "also read chrome://extensions-internals' extension ID -> name mapping")
 	timeout := flag.Duration("timeout", 15*time.Second, "overall timeout for the probe")
 	flag.Parse()
 
@@ -106,6 +107,17 @@ func main() {
 		fmt.Printf("\n%d origin(s) with a last-visited time:\n", len(visits))
 		for origin, t := range visits {
 			fmt.Printf("  %-45s %s\n", origin, t.Format(time.RFC3339))
+		}
+	}
+
+	if *extensions {
+		names, err := scan.DiscoverExtensionNames(ctx, client)
+		if err != nil {
+			log.Fatalf("discover extension names: %v", err)
+		}
+		fmt.Printf("\n%d extension(s):\n", len(names))
+		for id, name := range names {
+			fmt.Printf("  %-33s %s\n", id, name)
 		}
 	}
 }
