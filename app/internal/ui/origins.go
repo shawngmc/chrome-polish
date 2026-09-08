@@ -138,14 +138,10 @@ type OriginsPanel struct {
 	// lastVisited is each origin's most recent visit time, from
 	// scan.DiscoverLastVisited (chrome://history) — the only Chrome-side
 	// signal that tracks actual navigation, as opposed to storage/cookie
-	// bookkeeping. An origin absent from the map (e.g. cookie-only,
-	// never actually navigated to) renders as "—", same as
-	// lastVisitedAvailable being false.
+	// bookkeeping. An origin absent from the map (e.g. cookie-only, never
+	// actually navigated to, or no history scan has succeeded yet) renders
+	// as "—".
 	lastVisited map[string]time.Time
-	// lastVisitedAvailable mirrors usageAvailable: false until a history
-	// scan has succeeded at least once, so "—" means unknown rather than
-	// a misleading "never visited" for every row.
-	lastVisitedAvailable bool
 
 	// actions is the running log of removal/deep-clean operations
 	// performed this session, oldest first — the basis for Save Report.
@@ -374,9 +370,6 @@ func (p *OriginsPanel) cellText(origin scan.Origin, col int) string {
 		}
 		return formatBytes(p.usage[origin.Origin])
 	case colLastVisited:
-		if !p.lastVisitedAvailable {
-			return "—"
-		}
 		t, ok := p.lastVisited[origin.Origin]
 		if !ok {
 			return "—"
@@ -646,10 +639,7 @@ func (p *OriginsPanel) applyFilter() {
 // filter can shrink visible out from under whatever row index was
 // previously focused.
 func (p *OriginsPanel) clampRowFocus() {
-	switch {
-	case len(p.visible) == 0:
-		p.focusedRow = -1
-	case p.focusedRow >= len(p.visible):
+	if p.focusedRow >= len(p.visible) {
 		p.focusedRow = len(p.visible) - 1
 	}
 }
@@ -715,7 +705,6 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	p.usage = make(map[string]int64)
 	p.usageAvailable = false
 	p.lastVisited = make(map[string]time.Time)
-	p.lastVisitedAvailable = false
 	p.actions = nil
 	p.detail.SetText("Select a row to see why it was scored that way.")
 	p.filterEntry.SetText("") // triggers onFilterChanged -> applyFilter
@@ -1295,6 +1284,17 @@ func discoverOrigins(ctx context.Context, client *cdp.Client) (originScan, error
 	return res, nil
 }
 
+// appendScanStep appends a per-step summary fragment to msg — " (<label>
+// scan failed: <err>)" on failure, or " (<okFmt formatted with okArgs>)" on
+// success — the shape shared by every optional scan step's status line in
+// scan() and refresh().
+func appendScanStep(msg string, err error, label, okFmt string, okArgs ...any) string {
+	if err != nil {
+		return msg + fmt.Sprintf(" (%s scan failed: %v)", label, err)
+	}
+	return msg + " (" + fmt.Sprintf(okFmt, okArgs...) + ")"
+}
+
 func (p *OriginsPanel) scan(client *cdp.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), scanTimeout)
 	defer cancel()
@@ -1318,23 +1318,14 @@ func (p *OriginsPanel) scan(client *cdp.Client) {
 		}
 		if res.lastVisited != nil {
 			p.lastVisited = res.lastVisited
-			p.lastVisitedAvailable = true
 		}
 		p.recomputeScores()
 		defer p.endOp(client)
 
 		msg := fmt.Sprintf("Found %d candidate origin(s)", len(res.merged))
-		if res.siteDataErr != nil {
-			msg += fmt.Sprintf(" (site-data scan failed: %v)", res.siteDataErr)
-		} else {
-			msg += fmt.Sprintf(" (%d site group(s) scanned)", res.numGroups)
-		}
-		if res.lastVisitedErr != nil {
-			msg += fmt.Sprintf(" (last-visited scan failed: %v).", res.lastVisitedErr)
-		} else {
-			msg += fmt.Sprintf(" (%d with a last-visited time).", len(res.lastVisited))
-		}
-		p.status.SetText(msg)
+		msg = appendScanStep(msg, res.siteDataErr, "site-data", "%d site group(s) scanned", res.numGroups)
+		msg = appendScanStep(msg, res.lastVisitedErr, "last-visited", "%d with a last-visited time", len(res.lastVisited))
+		p.status.SetText(msg + ".")
 	})
 }
 
@@ -1421,7 +1412,6 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 		}
 		if res.lastVisited != nil {
 			p.lastVisited = res.lastVisited
-			p.lastVisitedAvailable = true
 		}
 		if permErr == nil {
 			p.permissions = permissions
@@ -1429,16 +1419,8 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 		p.recomputeScores()
 
 		msg := fmt.Sprintf("Found %d candidate origin(s)", len(res.merged))
-		if res.siteDataErr != nil {
-			msg += fmt.Sprintf(" (site-data scan failed: %v)", res.siteDataErr)
-		} else {
-			msg += fmt.Sprintf(" (%d site group(s) scanned)", res.numGroups)
-		}
-		if res.lastVisitedErr != nil {
-			msg += fmt.Sprintf(" (last-visited scan failed: %v)", res.lastVisitedErr)
-		} else {
-			msg += fmt.Sprintf(" (%d with a last-visited time)", len(res.lastVisited))
-		}
+		msg = appendScanStep(msg, res.siteDataErr, "site-data", "%d site group(s) scanned", res.numGroups)
+		msg = appendScanStep(msg, res.lastVisitedErr, "last-visited", "%d with a last-visited time", len(res.lastVisited))
 		if permErr != nil {
 			msg += fmt.Sprintf(". Checking permissions failed: %v", permErr)
 		} else {

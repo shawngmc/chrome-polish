@@ -41,15 +41,7 @@ const DefaultHistoryBudget = 20 * time.Second
 // it arrives rather than read once at the end.
 const lastVisitedScript = `
 (async function(budgetMs) {
-  function findByTag(root, tag) {
-    if (root.tagName && root.tagName.toLowerCase() === tag) return root;
-    var kids = root.shadowRoot ? Array.from(root.shadowRoot.children).concat(Array.from(root.children)) : Array.from(root.children || []);
-    for (var i = 0; i < kids.length; i++) {
-      var r = findByTag(kids[i], tag);
-      if (r) return r;
-    }
-    return null;
-  }
+` + findByTagScript + `
   var el = findByTag(document.documentElement, 'history-query-manager');
   if (!el) return JSON.stringify({error: 'history-query-manager not found'});
 

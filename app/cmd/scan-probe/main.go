@@ -98,16 +98,14 @@ func main() {
 		}
 	}
 
-	if !*lastVisited {
-		return
-	}
-
-	visits, err := scan.DiscoverLastVisited(ctx, client, 0)
-	if err != nil {
-		log.Fatalf("discover last visited: %v", err)
-	}
-	fmt.Printf("\n%d origin(s) with a last-visited time:\n", len(visits))
-	for origin, t := range visits {
-		fmt.Printf("  %-45s %s\n", origin, t.Format(time.RFC3339))
+	if *lastVisited {
+		visits, err := scan.DiscoverLastVisited(ctx, client, 0)
+		if err != nil {
+			log.Fatalf("discover last visited: %v", err)
+		}
+		fmt.Printf("\n%d origin(s) with a last-visited time:\n", len(visits))
+		for origin, t := range visits {
+			fmt.Printf("  %-45s %s\n", origin, t.Format(time.RFC3339))
+		}
 	}
 }
