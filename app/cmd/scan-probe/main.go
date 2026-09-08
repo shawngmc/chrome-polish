@@ -21,6 +21,7 @@ func main() {
 	swWindow := flag.Duration("sw-window", scan.DefaultServiceWorkerWindow, "how long to listen for service worker registrations")
 	permissions := flag.Bool("permissions", false, "also read notification/camera/microphone permission grants (briefly switches your active tab, once per category)")
 	siteData := flag.Bool("site-data", false, "also read chrome://settings/content/all's site-group/storage/partition data")
+	lastVisited := flag.Bool("last-visited", false, "also read chrome://history's per-origin last-visit times")
 	timeout := flag.Duration("timeout", 15*time.Second, "overall timeout for the probe")
 	flag.Parse()
 
@@ -79,23 +80,34 @@ func main() {
 		}
 	}
 
-	if !*siteData {
+	if *siteData {
+		groups, err := scan.DiscoverSiteData(ctx, client)
+		if err != nil {
+			log.Fatalf("discover site data: %v", err)
+		}
+		fmt.Printf("\n%d site group(s):\n", len(groups))
+		for _, g := range groups {
+			fmt.Printf("  %s (%d cookies)\n", g.DisplayName, g.NumCookies)
+			for _, o := range g.Origins {
+				partitioned := ""
+				if o.IsPartitioned {
+					partitioned = " [partitioned]"
+				}
+				fmt.Printf("    %-45s %8d bytes, %d cookies%s\n", o.Origin, o.Usage, o.NumCookies, partitioned)
+			}
+		}
+	}
+
+	if !*lastVisited {
 		return
 	}
 
-	groups, err := scan.DiscoverSiteData(ctx, client)
+	visits, err := scan.DiscoverLastVisited(ctx, client, 0)
 	if err != nil {
-		log.Fatalf("discover site data: %v", err)
+		log.Fatalf("discover last visited: %v", err)
 	}
-	fmt.Printf("\n%d site group(s):\n", len(groups))
-	for _, g := range groups {
-		fmt.Printf("  %s (%d cookies)\n", g.DisplayName, g.NumCookies)
-		for _, o := range g.Origins {
-			partitioned := ""
-			if o.IsPartitioned {
-				partitioned = " [partitioned]"
-			}
-			fmt.Printf("    %-45s %8d bytes, %d cookies%s\n", o.Origin, o.Usage, o.NumCookies, partitioned)
-		}
+	fmt.Printf("\n%d origin(s) with a last-visited time:\n", len(visits))
+	for origin, t := range visits {
+		fmt.Printf("  %-45s %s\n", origin, t.Format(time.RFC3339))
 	}
 }

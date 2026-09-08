@@ -24,8 +24,12 @@ import (
 	"github.com/shawngmc/chrome-polish/app/internal/scan"
 )
 
+// scanTimeout bounds discoverOrigins as a whole (origin discovery,
+// site-data grouping, and the chrome://history walk) — generous enough to
+// comfortably cover scan.DefaultHistoryBudget's own internal cap plus the
+// other two, faster steps.
 const (
-	scanTimeout      = 25 * time.Second
+	scanTimeout      = 60 * time.Second
 	permissionsCheck = "Check permissions"
 )
 
@@ -47,6 +51,7 @@ const (
 	colServiceWorker
 	colStorage
 	colStorageUsage
+	colLastVisited
 	colNotifications
 	colCamera
 	colMicrophone
@@ -61,6 +66,7 @@ var columnTitles = [numCols]string{
 	colServiceWorker: "Service Worker",
 	colStorage:       "Storage",
 	colStorageUsage:  "Storage Used",
+	colLastVisited:   "Last Visited",
 	colNotifications: "Notifications",
 	colCamera:        "Camera",
 	colMicrophone:    "Microphone",
@@ -99,7 +105,7 @@ type OriginsPanel struct {
 	status       *widget.Label
 	busy         *widget.ProgressBarInfinite
 	detail       *widget.Label
-	table        *widget.Table
+	table        *rowSelectTable
 
 	origins     []scan.Origin                               // full discovered set, in current sort order
 	visible     []scan.Origin                               // origins after the filter box, what the table renders
@@ -129,6 +135,18 @@ type OriginsPanel struct {
 	// run yet or failed (DESIGN.md's "degrade gracefully" principle).
 	usageAvailable bool
 
+	// lastVisited is each origin's most recent visit time, from
+	// scan.DiscoverLastVisited (chrome://history) — the only Chrome-side
+	// signal that tracks actual navigation, as opposed to storage/cookie
+	// bookkeeping. An origin absent from the map (e.g. cookie-only,
+	// never actually navigated to) renders as "—", same as
+	// lastVisitedAvailable being false.
+	lastVisited map[string]time.Time
+	// lastVisitedAvailable mirrors usageAvailable: false until a history
+	// scan has succeeded at least once, so "—" means unknown rather than
+	// a misleading "never visited" for every row.
+	lastVisitedAvailable bool
+
 	// actions is the running log of removal/deep-clean operations
 	// performed this session, oldest first — the basis for Save Report.
 	// Reset whenever SetClient starts a new session.
@@ -143,6 +161,13 @@ type OriginsPanel struct {
 	sortCol        int // -1 if unsorted
 	sortAsc        bool
 	colorBlindMode bool
+
+	// focusedRow is the keyboard-navigable "current" row, as an index into
+	// visible; -1 if none. Distinct from selected (which rows are checked
+	// for bulk removal) — arrow keys move this, Space toggles the checkbox
+	// for whichever row it's on. See rowSelectTable, which turns the
+	// underlying widget.Table's per-cell key handling into row navigation.
+	focusedRow int
 
 	// simpleMode is the default UI mode: on connect, origins and
 	// permissions are scanned automatically, and the manual Scan/Check
@@ -162,7 +187,9 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 		scores:         make(map[string]reputation.Score),
 		selected:       make(map[string]bool),
 		usage:          make(map[string]int64),
+		lastVisited:    make(map[string]time.Time),
 		sortCol:        -1,
+		focusedRow:     -1,
 		simpleMode:     prefs.BoolWithFallback(prefSimpleMode, true),
 		colorBlindMode: prefs.Bool(prefColorBlindMode),
 	}
@@ -176,7 +203,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.detail = widget.NewLabel("Select a row to see why it was scored that way.")
 	p.detail.Wrapping = fyne.TextWrapWord
 
-	p.table = widget.NewTable(
+	p.table = newRowSelectTable(p,
 		func() (int, int) { return len(p.visible), numCols },
 		func() fyne.CanvasObject {
 			bg := canvas.NewRectangle(color.Transparent)
@@ -193,9 +220,13 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 
 			origin := p.visible[id.Row]
 
-			bg.FillColor = color.Transparent
-			if id.Col == colScore {
+			switch {
+			case id.Row == p.focusedRow:
+				bg.FillColor = theme.Color(theme.ColorNameSelection)
+			case id.Col == colScore:
 				bg.FillColor = p.scoreColor(p.scores[origin.Origin].Total)
+			default:
+				bg.FillColor = color.Transparent
 			}
 			bg.Refresh()
 
@@ -241,7 +272,17 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 		btn.OnTapped = func() { p.onSortColumn(col) }
 		btn.Show()
 	}
-	p.table.OnSelected = func(id widget.TableCellID) { p.showDetail(id.Row) }
+	// A row can become "selected" either via a mouse click on any of its
+	// cells (widget.Table's own Tapped handling) or via rowSelectTable's
+	// keyboard navigation calling the embedded Table's Select — both paths
+	// land here, so focusedRow (and the row-highlight it drives in the
+	// UpdateCell callback above) stays in sync with whichever row was last
+	// interacted with either way.
+	p.table.OnSelected = func(id widget.TableCellID) {
+		p.focusedRow = id.Row
+		p.showDetail(id.Row)
+		p.table.Refresh() // repaint the row-highlight background onto/off of the affected rows
+	}
 	p.table.SetColumnWidth(colSelect, 40)
 	p.table.SetColumnWidth(colOrigin, 280)
 	p.table.SetColumnWidth(colScore, 70)
@@ -250,6 +291,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.table.SetColumnWidth(colServiceWorker, 130)
 	p.table.SetColumnWidth(colStorage, 80)
 	p.table.SetColumnWidth(colStorageUsage, 100)
+	p.table.SetColumnWidth(colLastVisited, 110)
 	p.table.SetColumnWidth(colNotifications, 130)
 	p.table.SetColumnWidth(colCamera, 100)
 	p.table.SetColumnWidth(colMicrophone, 110)
@@ -331,6 +373,15 @@ func (p *OriginsPanel) cellText(origin scan.Origin, col int) string {
 			return "—"
 		}
 		return formatBytes(p.usage[origin.Origin])
+	case colLastVisited:
+		if !p.lastVisitedAvailable {
+			return "—"
+		}
+		t, ok := p.lastVisited[origin.Origin]
+		if !ok {
+			return "—"
+		}
+		return t.Format("Jan 2, 2006")
 	case colNotifications, colCamera, colMicrophone:
 		return string(p.permissionStatus(origin.Origin, columnCategory[col]))
 	default:
@@ -586,7 +637,21 @@ func (p *OriginsPanel) applyFilter() {
 		}
 		p.visible = visible
 	}
+	p.clampRowFocus()
 	p.resizeOriginColumn()
+}
+
+// clampRowFocus keeps focusedRow a valid index into visible (or -1) after
+// visible is rebuilt by a filter, sort, or scan — e.g. narrowing the
+// filter can shrink visible out from under whatever row index was
+// previously focused.
+func (p *OriginsPanel) clampRowFocus() {
+	switch {
+	case len(p.visible) == 0:
+		p.focusedRow = -1
+	case p.focusedRow >= len(p.visible):
+		p.focusedRow = len(p.visible) - 1
+	}
 }
 
 // resizeOriginColumn sizes the Origin column to fit the longest origin
@@ -643,11 +708,14 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 	p.permissions = make(map[string]map[string]scan.PermissionStatus)
 	p.scores = make(map[string]reputation.Score)
 	p.sortCol = -1
+	p.focusedRow = -1
 	p.selected = make(map[string]bool)
 	p.homeGroup = nil
 	p.groupNames = nil
 	p.usage = make(map[string]int64)
 	p.usageAvailable = false
+	p.lastVisited = make(map[string]time.Time)
+	p.lastVisitedAvailable = false
 	p.actions = nil
 	p.detail.SetText("Select a row to see why it was scored that way.")
 	p.filterEntry.SetText("") // triggers onFilterChanged -> applyFilter
@@ -658,7 +726,7 @@ func (p *OriginsPanel) SetClient(client *cdp.Client) {
 
 	if client != nil {
 		if p.simpleMode {
-			p.beginOp("Connected. Scanning (this will briefly switch your active Chrome tab to read site data)...")
+			p.beginOp("Connected. Scanning (this will briefly switch your active Chrome tab to read site data and browsing history)...")
 			go p.refresh(client)
 		} else {
 			p.scanBtn.Enable()
@@ -722,6 +790,8 @@ func (p *OriginsPanel) less(a, b scan.Origin) bool {
 		return p.scores[a.Origin].Total < p.scores[b.Origin].Total
 	case colStorageUsage:
 		return p.usage[a.Origin] < p.usage[b.Origin]
+	case colLastVisited:
+		return p.lastVisited[a.Origin].Before(p.lastVisited[b.Origin])
 	default:
 		return p.sortKey(a) < p.sortKey(b)
 	}
@@ -772,6 +842,54 @@ func (p *OriginsPanel) recomputeScores() {
 	p.applyFilter()
 	p.table.Refresh()
 	p.updateReportButton()
+}
+
+// pageRowStep is how far PageUp/PageDown move focusedRow. widget.Table
+// doesn't expose how many rows actually fit in the current viewport, so
+// this is a fixed jump rather than a computed "one screenful" — same
+// trade-off most list/table widgets make when the exact visible extent
+// isn't available.
+const pageRowStep = 10
+
+// setRowFocus moves focusedRow to row (clamped to visible's bounds),
+// driving the row-highlight background (see the table's UpdateCell
+// callback) through the embedded Table's own Select — which also scrolls
+// the row into view and, via OnSelected, updates the detail pane. A no-op
+// if visible is empty.
+func (p *OriginsPanel) setRowFocus(row int) {
+	if len(p.visible) == 0 {
+		return
+	}
+	if row < 0 {
+		row = 0
+	} else if row >= len(p.visible) {
+		row = len(p.visible) - 1
+	}
+	p.table.Select(widget.TableCellID{Row: row, Col: colOrigin})
+}
+
+// moveRowFocus shifts focusedRow by delta, starting from row 0 if no row
+// is focused yet (so the first Up or Down press picks the first row,
+// matching typical list-navigation behavior rather than jumping past it).
+func (p *OriginsPanel) moveRowFocus(delta int) {
+	row := p.focusedRow
+	if row < 0 {
+		row = 0
+	} else {
+		row += delta
+	}
+	p.setRowFocus(row)
+}
+
+// toggleFocusedRow flips the selection checkbox (the same one the Select
+// column's checkbox drives) for whichever row is currently focused —
+// Space's row-select equivalent of clicking that checkbox.
+func (p *OriginsPanel) toggleFocusedRow() {
+	if p.focusedRow < 0 || p.focusedRow >= len(p.visible) {
+		return
+	}
+	origin := p.visible[p.focusedRow].Origin
+	p.onToggleSelect(origin, !p.selected[origin])
 }
 
 func (p *OriginsPanel) showDetail(row int) {
@@ -1118,7 +1236,7 @@ func (p *OriginsPanel) onScan() {
 		return
 	}
 
-	p.beginOp("Scanning (this will briefly switch your active Chrome tab to read site data)...")
+	p.beginOp("Scanning (this will briefly switch your active Chrome tab to read site data and browsing history)...")
 	go p.scan(client)
 }
 
@@ -1126,17 +1244,19 @@ func (p *OriginsPanel) onScan() {
 // combine it with other work (see refresh) can hold onto it before touching
 // panel state on the Fyne main thread.
 type originScan struct {
-	merged      []scan.Origin
-	homeGroup   map[string]string
-	groupNames  map[string]string
-	usage       map[string]int64
-	numGroups   int
-	siteDataErr error
+	merged         []scan.Origin
+	homeGroup      map[string]string
+	groupNames     map[string]string
+	usage          map[string]int64
+	numGroups      int
+	siteDataErr    error
+	lastVisited    map[string]time.Time
+	lastVisitedErr error
 }
 
-// discoverOrigins runs origin discovery and site-data grouping against
-// client, merging their results the same way for every caller (onScan and
-// the combined refresh flow alike).
+// discoverOrigins runs origin discovery, site-data grouping, and a
+// last-visited history scan against client, merging their results the same
+// way for every caller (onScan and the combined refresh flow alike).
 func discoverOrigins(ctx context.Context, client *cdp.Client) (originScan, error) {
 	origins, err := scan.DiscoverOrigins(ctx, client, 0)
 	if err != nil {
@@ -1161,6 +1281,17 @@ func discoverOrigins(ctx context.Context, client *cdp.Client) (originScan, error
 			}
 		}
 	}
+
+	// A failure here (or hitting scan.DefaultHistoryBudget on a very
+	// large history, which comes back as a partial map with no error —
+	// see DiscoverLastVisited's doc comment) shouldn't discard origins
+	// or site data already found.
+	lastVisited, lastVisitedErr := scan.DiscoverLastVisited(ctx, client, 0)
+	res.lastVisitedErr = lastVisitedErr
+	if lastVisitedErr == nil {
+		res.lastVisited = lastVisited
+	}
+
 	return res, nil
 }
 
@@ -1185,14 +1316,25 @@ func (p *OriginsPanel) scan(client *cdp.Client) {
 			p.usage = res.usage
 			p.usageAvailable = true
 		}
+		if res.lastVisited != nil {
+			p.lastVisited = res.lastVisited
+			p.lastVisitedAvailable = true
+		}
 		p.recomputeScores()
 		defer p.endOp(client)
 
+		msg := fmt.Sprintf("Found %d candidate origin(s)", len(res.merged))
 		if res.siteDataErr != nil {
-			p.status.SetText(fmt.Sprintf("Found %d candidate origin(s). Site-data scan failed: %v", len(res.merged), res.siteDataErr))
-			return
+			msg += fmt.Sprintf(" (site-data scan failed: %v)", res.siteDataErr)
+		} else {
+			msg += fmt.Sprintf(" (%d site group(s) scanned)", res.numGroups)
 		}
-		p.status.SetText(fmt.Sprintf("Found %d candidate origin(s) (%d site group(s) scanned).", len(res.merged), res.numGroups))
+		if res.lastVisitedErr != nil {
+			msg += fmt.Sprintf(" (last-visited scan failed: %v).", res.lastVisitedErr)
+		} else {
+			msg += fmt.Sprintf(" (%d with a last-visited time).", len(res.lastVisited))
+		}
+		p.status.SetText(msg)
 	})
 }
 
@@ -1242,7 +1384,7 @@ func (p *OriginsPanel) onRefresh() {
 		return
 	}
 
-	p.beginOp("Scanning (this will briefly switch your active Chrome tab to read site data)...")
+	p.beginOp("Scanning (this will briefly switch your active Chrome tab to read site data and browsing history)...")
 	go p.refresh(client)
 }
 
@@ -1277,6 +1419,10 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 			p.usage = res.usage
 			p.usageAvailable = true
 		}
+		if res.lastVisited != nil {
+			p.lastVisited = res.lastVisited
+			p.lastVisitedAvailable = true
+		}
 		if permErr == nil {
 			p.permissions = permissions
 		}
@@ -1287,6 +1433,11 @@ func (p *OriginsPanel) refresh(client *cdp.Client) {
 			msg += fmt.Sprintf(" (site-data scan failed: %v)", res.siteDataErr)
 		} else {
 			msg += fmt.Sprintf(" (%d site group(s) scanned)", res.numGroups)
+		}
+		if res.lastVisitedErr != nil {
+			msg += fmt.Sprintf(" (last-visited scan failed: %v)", res.lastVisitedErr)
+		} else {
+			msg += fmt.Sprintf(" (%d with a last-visited time)", len(res.lastVisited))
 		}
 		if permErr != nil {
 			msg += fmt.Sprintf(". Checking permissions failed: %v", permErr)
