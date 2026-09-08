@@ -99,7 +99,7 @@ func NewConnectPanel() *ConnectPanel {
 		p.browserSelect,
 		p.addrEntry,
 		p.wsEntry,
-		container.NewHBox(p.connectBtn, p.disconnectBtn),
+		container.NewGridWithColumns(2, p.connectBtn, p.disconnectBtn),
 		p.status,
 	)
 
