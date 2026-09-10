@@ -26,11 +26,13 @@ jobs:
             relay/go.sum
 
       # Fyne needs these to build at all on Linux, even just for `go
-      # build`/`go test` — not only for packaging.
+      # build`/`go test` — not only for packaging. go-gl/glfw compiles both
+      # its X11 and Wayland backends unless a build tag says otherwise, so
+      # the Wayland dev headers are required too.
       - name: Install Fyne Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
 
       - name: Build
         run: |
@@ -78,7 +80,7 @@ jobs:
         if: matrix.platform == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev
+          sudo apt-get install -y gcc libgl1-mesa-dev xorg-dev libwayland-dev libxkbcommon-dev
 
       - name: Determine version
         id: version
