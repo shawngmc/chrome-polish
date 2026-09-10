@@ -104,11 +104,20 @@ jobs:
             --appBuild "${{ github.run_number }}" \
             --release
 
+      - name: Create DMG
+        if: matrix.platform == 'darwin'
+        working-directory: app/cmd/chrome-polish
+        run: |
+          hdiutil create -volname "Chrome Polish" \
+            -srcfolder "Chrome Polish.app" \
+            -ov -format UDZO \
+            "Chrome Polish.dmg"
+
       - uses: actions/upload-artifact@v4
         with:
           name: chrome-polish-${{ matrix.platform }}
           path: |
-            app/cmd/chrome-polish/Chrome Polish.app
+            app/cmd/chrome-polish/*.dmg
             app/cmd/chrome-polish/*.exe
             app/cmd/chrome-polish/*.tar.xz
           if-no-files-found: ignore
