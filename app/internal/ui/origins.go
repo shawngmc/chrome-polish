@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"image/color"
-	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -96,7 +95,6 @@ type OriginsPanel struct {
 	scanBtn      *widget.Button
 	permsBtn     *widget.Button
 	refreshBtn   *widget.Button
-	blocklistBtn *widget.Button
 	optionsBtn   *widget.Button
 	removeBtn    *widget.Button
 	deepCleanBtn *widget.Button
@@ -311,8 +309,6 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.refreshBtn = widget.NewButton("Refresh", p.onRefresh)
 	p.refreshBtn.Disable()
 
-	p.blocklistBtn = widget.NewButton("Load blocklist...", p.onLoadBlocklist)
-
 	p.optionsBtn = widget.NewButton("Options...", p.onOptions)
 
 	p.removeBtn = widget.NewButton("Remove data...", p.onRemove)
@@ -331,7 +327,7 @@ func NewOriginsPanel(win fyne.Window) *OriginsPanel {
 	p.filterEntry.OnChanged = p.onFilterChanged
 
 	p.controls = container.NewVBox(
-		p.scanBtn, p.permsBtn, p.refreshBtn, p.blocklistBtn, p.optionsBtn, p.reportBtn,
+		p.scanBtn, p.permsBtn, p.refreshBtn, p.optionsBtn, p.reportBtn,
 		widget.NewSeparator(),
 		p.busy,
 		p.status,
@@ -954,36 +950,16 @@ func (p *OriginsPanel) onOptions() {
 	dialog.ShowCustom("Options", "Close", content, p.win)
 }
 
-func (p *OriginsPanel) onLoadBlocklist() {
-	dialog.ShowFileOpen(func(reader fyne.URIReadCloser, err error) {
-		if err != nil {
-			dialog.ShowError(err, p.win)
-			return
-		}
-		if reader == nil {
-			return // cancelled
-		}
-		defer reader.Close()
-
-		data, err := io.ReadAll(reader)
-		if err != nil {
-			dialog.ShowError(err, p.win)
-			return
-		}
-
-		p.blocklist = reputation.ParseBlocklist(data)
-		n := len(p.blocklist)
-		msg := fmt.Sprintf("Loaded %d blocklist %s.", n, pluralize(n, "entry", "entries"))
-
-		if len(p.origins) > 0 {
-			p.recomputeScores()
-			matched := p.countBlocklisted()
-			msg += fmt.Sprintf(" %d of %d scanned origin(s) matched.", matched, len(p.origins))
-		} else {
-			msg += " Scan for origins to check them against it."
-		}
-		p.status.SetText(msg)
-	}, p.win)
+// SetBlocklist replaces the panel's active blocklist — the merged,
+// enabled set compiled by a blocklist.Manager — and rescores against it
+// immediately if a scan has already run. It's the BlocklistsPanel's wiring
+// point, called every time the managed set of sources changes (add,
+// remove, enable/disable, refresh).
+func (p *OriginsPanel) SetBlocklist(bl reputation.Blocklist) {
+	p.blocklist = bl
+	if len(p.origins) > 0 {
+		p.recomputeScores()
+	}
 }
 
 // onSaveReport writes a plain-text summary of the session (scored origins

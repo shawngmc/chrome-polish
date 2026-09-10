@@ -215,6 +215,35 @@ func TestParseBlocklistHostsFileFormat(t *testing.T) {
 	}
 }
 
+func TestParseBlocklistAdblockFormat(t *testing.T) {
+	data := []byte(`[Adblock Plus]
+! Title: Example
+! this is a comment
+||example.com^
+||tracker.example.net^$third-party
+||example.com/ads^
+@@||exempt.com^
+||*.wildcard.com^
+`)
+	bl := ParseBlocklist(data)
+
+	want := []string{"example.com", "tracker.example.net"}
+	if len(bl) != len(want) {
+		t.Fatalf("got %d entries %+v, want %d (%v)", len(bl), bl, len(want), want)
+	}
+	for _, h := range want {
+		if !bl[h] {
+			t.Errorf("missing expected entry %q", h)
+		}
+	}
+	if bl["exempt.com"] {
+		t.Error("exception rule \"@@||exempt.com^\" should not be added to the blocklist")
+	}
+	if bl["*.wildcard.com"] || bl["wildcard.com"] {
+		t.Error("wildcard rule \"||*.wildcard.com^\" should be skipped, not reduced to a host")
+	}
+}
+
 func TestMatchesBlocklistDoesNotOverMatch(t *testing.T) {
 	// "notevil.com" should not match a blocklist entry for "evil.com".
 	bl := Blocklist{"evil.com": true}

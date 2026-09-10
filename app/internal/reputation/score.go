@@ -181,15 +181,40 @@ func matchesBlocklist(host string, blocklist Blocklist) bool {
 	}
 }
 
-// ParseBlocklist parses a blocklist in either of two common formats: a
-// bare hostname (or suffix, e.g. "example.com") per line, or a classic
-// hosts file line ("0.0.0.0 example.com", optionally with more than one
-// hostname after the IP) — the format most public malware/scam domain
-// lists (e.g. StevenBlack/hosts, URLhaus) actually ship in. Blank lines,
-// lines starting with "#", and inline "# ..." comments are ignored.
+// ParseBlocklist parses a blocklist in any of three common formats: a bare
+// hostname (or suffix, e.g. "example.com") per line; a classic hosts file
+// line ("0.0.0.0 example.com", optionally with more than one hostname
+// after the IP) — the format most public malware/scam domain lists (e.g.
+// StevenBlack/hosts, URLhaus) actually ship in; or an Adblock Plus filter
+// list ("||example.com^", optionally with trailing "$options") — the
+// format oisd.nl's lists ship in since they discontinued hosts/domain
+// downloads in 2024. Blank lines, lines starting with "#", "!" (Adblock
+// comment), or "[" (Adblock header), inline "# ..." comments, and Adblock
+// exception rules ("@@...") are ignored. Adblock rules with a path or
+// wildcard component (e.g. "||example.com/ads^", "||*.example.com^") are
+// reduced to their bare hostname where unambiguous, or skipped — this
+// parser only supports hostname-suffix matching, not full ad-blocking
+// request matching.
 func ParseBlocklist(data []byte) Blocklist {
 	bl := make(Blocklist)
 	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "":
+			continue
+		case strings.HasPrefix(line, "["):
+			continue
+		case strings.HasPrefix(line, "!"):
+			continue
+		case strings.HasPrefix(line, "@@"):
+			continue
+		case strings.HasPrefix(line, "||"):
+			if h := parseAdblockDomainRule(line); h != "" {
+				bl[h] = true
+			}
+			continue
+		}
+
 		if i := strings.Index(line, "#"); i >= 0 {
 			line = line[:i]
 		}
@@ -207,4 +232,25 @@ func ParseBlocklist(data []byte) Blocklist {
 		}
 	}
 	return bl
+}
+
+// parseAdblockDomainRule extracts the bare hostname from an Adblock Plus
+// domain-anchor rule ("||example.com^", optionally with a path and/or
+// "$options" trailing it), or returns "" if the rule doesn't reduce to an
+// unambiguous hostname (e.g. it contains a wildcard).
+func parseAdblockDomainRule(line string) string {
+	host := strings.TrimPrefix(line, "||")
+
+	end := len(host)
+	for _, sep := range []string{"^", "$", "/"} {
+		if i := strings.Index(host, sep); i >= 0 && i < end {
+			end = i
+		}
+	}
+	host = host[:end]
+
+	if host == "" || strings.Contains(host, "*") {
+		return ""
+	}
+	return strings.ToLower(host)
 }
